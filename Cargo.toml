@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/recon-core",
+    "crates/recon-schema",
+    "crates/recon-web",
+    "crates/recon-report",
+    "crates/recon-cli",
+    "crates/recon-orch",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+recon-core = { path = "crates/recon-core" }
+recon-schema = { path = "crates/recon-schema" }
+recon-report = { path = "crates/recon-report" }
+recon-orch = { path = "crates/recon-orch" }
+
+# Serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Web
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+maud = "0.27"
+rust-embed = { version = "8", features = ["mime-guess"] }
+
+# DataFrame engine. Kept lean on purpose: no cloud/async stack (reqwest,
+# object_store, tokio-rustls) — those are pulled by `new_streaming` and are not
+# needed for local fixed-width reconciliation. The lazy API is retained; a true
+# out-of-core streaming engine swap is a [FUTURE] behind the engine seam.
+polars = { version = "0.51", default-features = false, features = [
+    "lazy",
+    "parquet",
+    "strings",
+    "coalesce",
+    "semi_anti_join",
+    "fmt",
+] }
+
+# Time
+jiff = { version = "0.2", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async runtime (web + orch)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "process"] }
+
+# Dev/test
+insta = { version = "1", features = ["yaml"] }
+tempfile = "3"

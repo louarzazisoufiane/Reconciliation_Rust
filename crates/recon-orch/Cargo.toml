@@ -1,0 +1,33 @@
+[package]
+name = "recon-orch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lib]
+name = "recon_orch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "recon-orch"
+path = "src/main.rs"
+
+[dependencies]
+recon-core.workspace = true
+recon-schema.workspace = true
+recon-report.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+jiff.workspace = true
+serde.workspace = true
+serde_norway.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

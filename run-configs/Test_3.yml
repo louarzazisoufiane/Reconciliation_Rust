@@ -1,0 +1,165 @@
+run_name: Test_3
+key: trans_num
+duplicate_policy: report_continue
+compare_columns:
+- unnamed
+- transdatetranstime
+- cc_num
+- merchant
+- category
+- amt
+- first
+- last
+- gender
+- street
+- city
+- state
+- zip
+- lat
+- long
+- city_pop
+- job
+- dob
+- unix_time
+- merch_lat
+- merch_long
+- is_fraud
+- merch_zipcode
+normalization:
+  amt:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  category:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  cc_num:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  city:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  city_pop:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  dob:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  first:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  gender:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  is_fraud:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  job:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  last:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  lat:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  long:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  merch_lat:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  merch_long:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  merch_zipcode:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  merchant:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  state:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  street:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  trans_num:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  transdatetranstime:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  unix_time:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  unnamed:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+  zip:
+    trim: false
+    strip_leading_zeros: false
+    unify_null: false
+    case_fold: false
+source_a:
+  path: /home/soufiane/Desktop/HTTmm/transactions_fixedwidth.txt
+  schema_ref:
+    name: Transactions_d_schema
+    version: 1
+source_b:
+  path: /home/soufiane/Desktop/HTTmm/transactions_fixedwidth2.txt
+  schema_ref:
+    name: Transactions_d_schema
+    version: 1
+report:
+  embed_row_cap: 5000
+  sidecar_format: parquet
+  output_dir: reports
+completion_detection:
+  method: size_stability
+  stability_minutes: 5

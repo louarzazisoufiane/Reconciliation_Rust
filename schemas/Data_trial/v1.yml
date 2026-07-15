@@ -1,0 +1,35 @@
+name: Data_trial
+version: 1
+encoding: utf-8
+index_base: 0
+fields:
+- name: id
+  start: 1
+  length: 5
+- name: First_name
+  start: 6
+  length: 15
+- name: Last_name
+  start: 16
+  length: 25
+- name: age
+  start: 26
+  length: 28
+- name: sal
+  start: 29
+  length: 36
+- name: Dept
+  start: 37
+  length: 48
+- name: Start_date
+  start: 49
+  length: 58
+- name: Bool
+  start: 59
+  length: 63
+- name: Rating
+  start: 64
+  length: 67
+- name: origin
+  start: 68
+  length: 77
