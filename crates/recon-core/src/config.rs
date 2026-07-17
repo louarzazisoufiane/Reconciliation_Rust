@@ -90,10 +90,10 @@ pub struct ResolvedNorm {
 
 impl Normalization {
     /// Resolve toggles to concrete booleans using the documented defaults
-    /// (`trim` ON, everything else OFF).
+    /// (`trim` OFF, everything else OFF).
     pub fn resolved(&self) -> ResolvedNorm {
         ResolvedNorm {
-            trim: self.trim.unwrap_or(true),
+            trim: self.trim.unwrap_or(false),
             strip_leading_zeros: self.strip_leading_zeros.unwrap_or(false),
             unify_null: self.unify_null.unwrap_or(false),
             case_fold: self.case_fold.unwrap_or(false),

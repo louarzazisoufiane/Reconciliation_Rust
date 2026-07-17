@@ -14,6 +14,7 @@
 //! is reserved for genuine engine/IO errors.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -109,14 +110,53 @@ fn null_str() -> Expr {
     lit(NULL).cast(DataType::String)
 }
 
-/// Count the rows of a lazy frame by collecting only a `len()` aggregation.
-fn count_rows(lf: LazyFrame) -> ReconResult<usize> {
-    let df = lf.select([len().alias("n")]).collect()?;
-    let n = df
-        .column("n")
-        .and_then(|c| c.get(0).map_err(Into::into))
-        .map_err(|e: PolarsError| ReconError::engine(e.to_string()))?;
-    Ok(n.try_extract::<u64>().unwrap_or(0) as usize)
+/// Per-side row/duplicate statistics, computed in one query per side.
+struct SideStats {
+    /// Total rows read.
+    rows: usize,
+    /// Distinct keys that appear more than once.
+    dup_keys: usize,
+    /// Total rows across those duplicate keys.
+    dup_rows: usize,
+}
+
+/// Compute [`SideStats`] from a single `group_by(key)` aggregation, replacing
+/// the three separate count queries (total rows, duplicate keys, duplicate
+/// rows) that each re-executed the source.
+fn side_stats(lf: LazyFrame, key: &str) -> ReconResult<SideStats> {
+    // Conditional sums (not `filter()` aggregations) so every aggregate input
+    // has equal length — a requirement of the streaming engine's lowering.
+    let is_dup = col("__n").gt(lit(1u32));
+    let df = lf
+        .group_by([col(key)])
+        .agg([len().alias("__n")])
+        .select([
+            col("__n").cast(DataType::UInt64).sum().alias("rows"),
+            is_dup
+                .clone()
+                .cast(DataType::UInt64)
+                .sum()
+                .alias("dup_keys"),
+            when(is_dup)
+                .then(col("__n"))
+                .otherwise(lit(0u32))
+                .cast(DataType::UInt64)
+                .sum()
+                .alias("dup_rows"),
+        ])
+        .collect_with_engine(Engine::Streaming)?;
+    let get = |name: &str| -> usize {
+        df.column(name)
+            .ok()
+            .and_then(|c| c.get(0).ok())
+            .and_then(|v| v.try_extract::<u64>().ok())
+            .unwrap_or(0) as usize
+    };
+    Ok(SideStats {
+        rows: get("rows"),
+        dup_keys: get("dup_keys"),
+        dup_rows: get("dup_rows"),
+    })
 }
 
 /// Run one comparison. Writes the full diff to `sidecar_path`; returns capped
@@ -157,19 +197,28 @@ pub fn run_comparison(
         }
     }
 
-    let lf_a = prepare_side(&config.source_a.path, schema_a, config, &cols)?;
-    let lf_b = prepare_side(&config.source_b.path, schema_b, config, &cols)?;
+    // Stage both sources exactly once; the staged temp files (owned by the
+    // sources) must outlive every query below, so keep them in scope.
+    let source_a = read_fixed_width(&config.source_a.path, schema_a)?;
+    let source_b = read_fixed_width(&config.source_b.path, schema_b)?;
 
-    let rows_a = count_rows(lf_a.clone())?;
-    let rows_b = count_rows(lf_b.clone())?;
+    // Each fixed-width file is parsed exactly once (staged to Parquet by the
+    // reader); every query below re-scans the staged file lazily. Deliberately
+    // NOT `.cache()`d: a cache node materializes the whole prepared side in
+    // RAM per query, which measured strictly worse (peak RSS +25% at 2M rows,
+    // no wall-time win) than re-scanning the columnar staging file.
+    let lf_a = prepare_side(source_a.lazy(), config, &cols);
+    let lf_b = prepare_side(source_b.lazy(), config, &cols);
 
-    // --- Duplicate detection (decision 7) -----------------------------------
+    // --- Row counts + duplicate detection (decision 7), one query per side ---
+    let stats_a = side_stats(lf_a.clone(), &key)?;
+    let stats_b = side_stats(lf_b.clone(), &key)?;
+    let (rows_a, rows_b) = (stats_a.rows, stats_b.rows);
+    let (dup_keys_a_ct, dup_keys_b_ct) = (stats_a.dup_keys, stats_b.dup_keys);
+    let (dup_rows_a, dup_rows_b) = (stats_a.dup_rows, stats_b.dup_rows);
+
     let dup_keys_a = duplicate_keys(lf_a.clone(), &key);
     let dup_keys_b = duplicate_keys(lf_b.clone(), &key);
-    let dup_keys_a_ct = count_rows(dup_keys_a.clone())?;
-    let dup_keys_b_ct = count_rows(dup_keys_b.clone())?;
-    let dup_rows_a = count_rows(semi(lf_a.clone(), dup_keys_a.clone(), &key))?;
-    let dup_rows_b = count_rows(semi(lf_b.clone(), dup_keys_b.clone(), &key))?;
 
     // De-duplicated remainder that participates in the join.
     let a_clean = anti(lf_a.clone(), dup_keys_a.clone(), &key);
@@ -194,7 +243,7 @@ pub fn run_comparison(
         .clone()
         .group_by([col("__category")])
         .agg([len().alias("n")])
-        .collect()?;
+        .collect_with_engine(Engine::Streaming)?;
     let cat = |name: &str| category_count(&counts, name);
     let only_in_a = cat("only_in_a");
     let only_in_b = cat("only_in_b");
@@ -254,20 +303,14 @@ pub fn run_comparison(
     Ok(ReconOutcome { summary, samples })
 }
 
-/// Read one source, select the needed columns, and apply normalization.
-fn prepare_side(
-    path: &Path,
-    schema: &Schema,
-    config: &RunConfig,
-    cols: &[String],
-) -> ReconResult<LazyFrame> {
-    let lf = read_fixed_width(path, schema)?;
+/// Select the needed columns from a staged source and apply normalization.
+fn prepare_side(lf: LazyFrame, config: &RunConfig, cols: &[String]) -> LazyFrame {
     let selected = lf.select(cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>());
     let norm_exprs: Vec<Expr> = cols
         .iter()
         .map(|c| normalize_expr(c, config.norm_for(c)))
         .collect();
-    Ok(selected.with_columns(norm_exprs))
+    selected.with_columns(norm_exprs)
 }
 
 /// The distinct keys that repeat within a side (`count > 1`).
@@ -421,16 +464,21 @@ fn joined_empty(key: &str, compares: &[String]) -> LazyFrame {
 }
 
 /// Stream a lazy frame to Parquet.
+///
+/// The plan is executed on the streaming engine with a file sink: batches are
+/// written as they are produced and the diff is never collected whole
+/// (decision 13's "DO NOT collect full diffs").
 fn write_sidecar(lf: LazyFrame, path: &Path) -> ReconResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Collect via the streaming engine, then write. Diffs are small relative to
-    // the inputs; the join above is never collected whole.
-    let mut df = lf.collect()?;
-    let file = std::fs::File::create(path)
-        .map_err(|e| ReconError::Io(format!("creating sidecar {}: {e}", path.display())))?;
-    ParquetWriter::new(file).finish(&mut df)?;
+    lf.sink_parquet(
+        SinkTarget::Path(PlPath::Local(Arc::from(path))),
+        ParquetWriteOptions::default(),
+        None,
+        SinkOptions::default(),
+    )?
+    .collect_with_engine(Engine::Streaming)?;
     Ok(())
 }
 
@@ -462,7 +510,7 @@ fn collect_samples(
             .filter(col("__category").eq(lit("only_in_a")))
             .select(exprs)
             .limit(cap_u)
-            .collect()?
+            .collect_with_engine(Engine::Streaming)?
     };
 
     let only_b = {
@@ -476,7 +524,7 @@ fn collect_samples(
             .filter(col("__category").eq(lit("only_in_b")))
             .select(exprs)
             .limit(cap_u)
-            .collect()?
+            .collect_with_engine(Engine::Streaming)?
     };
 
     // changed: full row, both sides, per compared column.
@@ -491,7 +539,7 @@ fn collect_samples(
             .filter(col("__category").eq(lit("changed")))
             .select(exprs)
             .limit(cap_u)
-            .collect()?
+            .collect_with_engine(Engine::Streaming)?
     };
 
     // duplicates: key, side, count.
@@ -512,7 +560,7 @@ fn collect_samples(
     let duplicates = concat([dup_a, dup_b], UnionArgs::default())
         .map_err(|e| ReconError::engine(e.to_string()))?
         .limit(cap_u)
-        .collect()?;
+        .collect_with_engine(Engine::Streaming)?;
 
     Ok(Samples {
         only_in_a: only_a,
@@ -520,4 +568,146 @@ fn collect_samples(
         changed,
         duplicates,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CompletionDetection, ReportConfig, SidecarFormat, SourceConfig};
+    use crate::schema::{Field, SchemaRef};
+    use std::io::Write;
+
+    fn schema() -> Schema {
+        Schema {
+            name: "t".into(),
+            version: 1,
+            encoding: "utf-8".into(),
+            index_base: 0,
+            fields: vec![
+                Field { name: "id".into(), start: 0, length: 3 },
+                Field { name: "name".into(), start: 3, length: 5 },
+            ],
+        }
+    }
+
+    fn write_source(dir: &Path, file: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(file);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    fn config(dir: &Path, path_a: std::path::PathBuf, path_b: std::path::PathBuf) -> RunConfig {
+        let schema_ref = SchemaRef { name: "t".into(), version: 1 };
+        RunConfig {
+            run_name: "test_run".into(),
+            key: "id".into(),
+            duplicate_policy: Default::default(),
+            compare_columns: vec!["name".into()],
+            normalization: Default::default(),
+            source_a: SourceConfig { path: path_a, schema_ref: schema_ref.clone() },
+            source_b: SourceConfig { path: path_b, schema_ref },
+            report: ReportConfig {
+                embed_row_cap: 10,
+                sidecar_format: SidecarFormat::Parquet,
+                output_dir: dir.to_path_buf(),
+            },
+            completion_detection: CompletionDetection::default(),
+        }
+    }
+
+    #[test]
+    fn sidecar_streamed_with_correct_rows_and_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        // A: 001 matches, 002 changed, 003 only in A, 004 duplicated twice.
+        let a = write_source(dir.path(), "a.txt", "001Alice\n002Bob  \n003Carol\n004Dup1 \n004Dup2 \n");
+        // B: 001 matches, 002 differs, 005 only in B.
+        let b = write_source(dir.path(), "b.txt", "001Alice\n002Bobby\n005Eve  \n");
+        let cfg = config(dir.path(), a, b);
+        let sidecar = dir.path().join("out").join("diff.parquet");
+
+        let outcome = run_comparison(
+            &cfg,
+            &schema(),
+            &schema(),
+            "run-1",
+            jiff::Timestamp::now(),
+            &sidecar,
+        )
+        .unwrap();
+
+        let s = &outcome.summary;
+        assert_eq!(s.rows_a, 5);
+        assert_eq!(s.rows_b, 3);
+        assert_eq!(s.only_in_a, 1);
+        assert_eq!(s.only_in_b, 1);
+        assert_eq!(s.changed, 1);
+        assert_eq!(s.matched, 1);
+        assert_eq!(s.dup_keys_a, 1);
+        assert_eq!(s.dup_rows_a, 2);
+        assert_eq!(s.dup_keys_b, 0);
+        assert_eq!(s.dup_rows_b, 0);
+        assert!(!s.pass);
+
+        // The sink must have produced the sidecar with the full uncapped diff:
+        // 3 non-matched join rows + 2 duplicate-A rows.
+        let df = LazyFrame::scan_parquet(
+            PlPath::Local(Arc::from(sidecar.as_path())),
+            ScanArgsParquet::default(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+        assert_eq!(df.height(), 5);
+        let names: Vec<&str> = df.get_column_names_str();
+        assert_eq!(names, vec!["id", "name__a", "name__b", "__category"]);
+        for c in df.get_columns() {
+            assert_eq!(c.dtype(), &DataType::String);
+        }
+        let cats = df.column("__category").unwrap().str().unwrap();
+        let mut counts = std::collections::BTreeMap::new();
+        for v in cats.into_iter().flatten() {
+            *counts.entry(v.to_string()).or_insert(0usize) += 1;
+        }
+        assert_eq!(counts.get("only_in_a"), Some(&1));
+        assert_eq!(counts.get("only_in_b"), Some(&1));
+        assert_eq!(counts.get("changed"), Some(&1));
+        assert_eq!(counts.get("duplicate_a"), Some(&2));
+        assert_eq!(counts.get("duplicate_b"), None);
+    }
+
+    #[test]
+    fn clean_run_passes_with_empty_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_source(dir.path(), "a.txt", "001Alice\n002Bob  \n");
+        let b = write_source(dir.path(), "b.txt", "001Alice\n002Bob  \n");
+        let cfg = config(dir.path(), a, b);
+        let sidecar = dir.path().join("diff.parquet");
+
+        let outcome = run_comparison(
+            &cfg,
+            &schema(),
+            &schema(),
+            "run-2",
+            jiff::Timestamp::now(),
+            &sidecar,
+        )
+        .unwrap();
+        assert!(outcome.summary.pass);
+        assert_eq!(outcome.summary.matched, 2);
+        assert_eq!(outcome.summary.match_rate, 1.0);
+
+        let df = LazyFrame::scan_parquet(
+            PlPath::Local(Arc::from(sidecar.as_path())),
+            ScanArgsParquet::default(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+        assert_eq!(df.height(), 0);
+        assert_eq!(
+            df.get_column_names_str(),
+            vec!["id", "name__a", "name__b", "__category"]
+        );
+    }
 }

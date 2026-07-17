@@ -175,13 +175,16 @@ async fn schemas_infer(Json(req): Json<InferRequest>) -> Json<Schema> {
 }
 
 /// Draft a schema from a pasted sample line: each run of non-space bytes
-/// becomes a field, offsets taken from the byte position in the sample. The
-/// operator still reviews/edits before saving (decision 5's "draft" state).
+/// becomes a field, offsets taken from the byte position in the sample. A
+/// field spans its own padding — it runs to the next field's start, and the
+/// last one to the end of the line — so that rows whose values fill more of
+/// the column than the sample's do are not truncated. The operator still
+/// reviews/edits before saving (decision 5's "draft" state).
 fn infer_draft(sample: &str) -> Schema {
-    let bytes = sample.as_bytes();
-    let mut fields = Vec::new();
+    let line = sample.trim_end_matches(['\r', '\n']);
+    let bytes = line.as_bytes();
+    let mut starts = Vec::new();
     let mut i = 0;
-    let mut n = 1;
     while i < bytes.len() {
         while i < bytes.len() && bytes[i] == b' ' {
             i += 1;
@@ -189,17 +192,20 @@ fn infer_draft(sample: &str) -> Schema {
         if i >= bytes.len() {
             break;
         }
-        let start = i;
+        starts.push(i);
         while i < bytes.len() && bytes[i] != b' ' {
             i += 1;
         }
-        fields.push(Field {
-            name: format!("field{n}"),
-            start,
-            length: i - start,
-        });
-        n += 1;
     }
+    let fields = starts
+        .iter()
+        .enumerate()
+        .map(|(n, &start)| Field {
+            name: format!("field{}", n + 1),
+            start,
+            length: starts.get(n + 1).copied().unwrap_or(bytes.len()) - start,
+        })
+        .collect();
     Schema {
         name: String::new(),
         version: 0,
@@ -358,7 +364,16 @@ async fn runs_create(
         .map_err(|e| AppError(ReconError::Io(format!("writing {}: {e}", cfg_path.display()))))?;
 
     let run_id = generate_run_id();
-    let result = run_oneshot(&cfg, state.store.as_ref(), &run_id)?;
+    // The engine's streaming collects/sinks call `block_on` on polars' own
+    // tokio runtime, which panics if invoked from a runtime worker thread —
+    // so the whole (blocking, CPU/IO-heavy) run moves off the async runtime.
+    let result = {
+        let store = state.store.clone();
+        let run_id = run_id.clone();
+        tokio::task::spawn_blocking(move || run_oneshot(&cfg, store.as_ref(), &run_id))
+            .await
+            .map_err(|e| AppError(ReconError::engine(format!("run task failed: {e}"))))??
+    };
     let file = result
         .paths
         .report_html
@@ -382,4 +397,24 @@ async fn runs_list(State(state): State<AppState>) -> Result<Json<Vec<ManifestEnt
     let mut entries = recon_report::load_manifest(&state.reports_dir)?;
     entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(Json(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inferred_fields_span_their_padding() {
+        //                    0         1         2
+        //                    012345678901234567890123
+        let schema = infer_draft("ID001   Ada       12.50  ");
+        let spans: Vec<_> = schema
+            .fields
+            .iter()
+            .map(|f| (f.start, f.length))
+            .collect();
+        // field2 keeps the 7 spaces of padding before field3, and the last
+        // field runs to the end of the line rather than to its content.
+        assert_eq!(spans, vec![(0, 8), (8, 10), (18, 7)]);
+    }
 }

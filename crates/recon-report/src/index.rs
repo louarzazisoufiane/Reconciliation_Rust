@@ -69,7 +69,7 @@ pub fn render_index(entries: &[ManifestEntry]) -> String {
 
 fn run_row(e: &ManifestEntry) -> Markup {
     let (cls, label) = if e.pass { ("pass", "PASS") } else { ("fail", "DIFF") };
-    let rate = format!("{:.2}%", e.match_rate * 100.0);
+    let rate = crate::report::format_match_rate(e.match_rate);
     html! {
         tr {
             td { (e.timestamp) }

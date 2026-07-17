@@ -41,10 +41,12 @@ tower-http = { version = "0.6", features = ["fs", "trace"] }
 maud = "0.27"
 rust-embed = { version = "8", features = ["mime-guess"] }
 
-# DataFrame engine. Kept lean on purpose: no cloud/async stack (reqwest,
-# object_store, tokio-rustls) — those are pulled by `new_streaming` and are not
-# needed for local fixed-width reconciliation. The lazy API is retained; a true
-# out-of-core streaming engine swap is a [FUTURE] behind the engine seam.
+# DataFrame engine. `new_streaming` (polars-stream) is REQUIRED: sinks only run
+# with bounded memory on the streaming engine, and the 1M–100M rows/source
+# target depends on `sink_parquet` streaming the full diff instead of
+# collecting it. Without the feature, sink execution falls back to the
+# in-memory engine and materializes the whole result. This pulls in the
+# heavier polars-stream dependency tree; that is the accepted cost.
 polars = { version = "0.51", default-features = false, features = [
     "lazy",
     "parquet",
@@ -52,6 +54,7 @@ polars = { version = "0.51", default-features = false, features = [
     "coalesce",
     "semi_anti_join",
     "fmt",
+    "new_streaming",
 ] }
 
 # Time

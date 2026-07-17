@@ -32,6 +32,28 @@ pub fn artifact_stem(timestamp: &str, run_id: &str) -> String {
     format!("{formatted}_{run_id}")
 }
 
+/// Format a match rate as a percentage that is exact at the boundaries:
+/// "100%" appears only for a perfect run and "0%" only when nothing matched.
+/// Everything in between is truncated — never rounded up — and gains decimals
+/// until it is distinguishable from zero.
+pub fn format_match_rate(rate: f64) -> String {
+    if rate >= 1.0 {
+        return "100%".to_string();
+    }
+    if rate <= 0.0 {
+        return "0%".to_string();
+    }
+    let pct = rate * 100.0;
+    for decimals in 2..=12u32 {
+        let scale = 10f64.powi(decimals as i32);
+        let truncated = (pct * scale).floor() / scale;
+        if truncated > 0.0 {
+            return format!("{truncated:.prec$}%", prec = decimals as usize);
+        }
+    }
+    "<0.000000000001%".to_string()
+}
+
 /// Escape a JSON string for safe inlining inside a `<script>` element.
 fn escape_script_json(s: &str) -> String {
     s.replace("</", "<\\/")
@@ -63,7 +85,7 @@ fn stat_card(label: &str, n: usize) -> Markup {
 /// Render the complete self-contained HTML document.
 pub fn render_report(summary: &Summary, outcome: &ReconOutcome) -> ReconResult<String> {
     let island = data_island(summary, outcome)?;
-    let pct = format!("{:.2}%", summary.match_rate * 100.0);
+    let pct = format_match_rate(summary.match_rate);
     let (badge_class, badge_text) = if summary.pass {
         ("pass", "PASS")
     } else {
@@ -164,4 +186,36 @@ pub fn publish(output_dir: &Path, outcome: &ReconOutcome) -> ReconResult<Publish
         report_html: html_path,
         index_html: index_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_match_rate;
+
+    #[test]
+    fn boundaries_are_exact() {
+        assert_eq!(format_match_rate(1.0), "100%");
+        assert_eq!(format_match_rate(0.0), "0%");
+    }
+
+    #[test]
+    fn near_perfect_never_displays_100() {
+        // 3 differences in 1,000,000 rows.
+        assert_eq!(format_match_rate(999_997.0 / 1_000_000.0), "99.99%");
+        // 1 difference in 100,000,000 rows.
+        assert_eq!(format_match_rate(99_999_999.0 / 100_000_000.0), "99.99%");
+    }
+
+    #[test]
+    fn near_zero_never_displays_0() {
+        // 1 match in 1,000,000 rows: gains decimals until nonzero.
+        let s = format_match_rate(1.0 / 1_000_000.0);
+        assert!(s.starts_with("0.000") && s != "0%" && s.trim_end_matches('%').parse::<f64>().unwrap() > 0.0, "{s}");
+    }
+
+    #[test]
+    fn ordinary_rates_truncate_to_two_decimals() {
+        assert_eq!(format_match_rate(0.5), "50.00%");
+        assert_eq!(format_match_rate(0.98765), "98.76%");
+    }
 }

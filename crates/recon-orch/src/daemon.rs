@@ -99,7 +99,13 @@ impl Daemon {
         let pairs = self.config.pairs.clone();
         loop {
             for pair_path in &pairs {
-                if let Err(e) = self.tick_pair(pair_path) {
+                // `tick_pair` runs the engine, whose streaming collects/sinks
+                // call `block_on` on polars' own tokio runtime — that panics
+                // on a runtime worker thread, so step off the async runtime.
+                // (`block_in_place` needs the multi-thread runtime, which is
+                // what the `#[tokio::main]` binary provides.)
+                let tick = tokio::task::block_in_place(|| self.tick_pair(pair_path));
+                if let Err(e) = tick {
                     warn!(pair = %pair_path.display(), error = %e, "pair tick failed; will retry");
                 }
             }

@@ -13,5 +13,5 @@ pub mod table;
 
 pub use index::{regenerate_index, render_index};
 pub use manifest::{ManifestEntry, load as load_manifest};
-pub use report::{PublishedPaths, artifact_stem, publish, render_report};
+pub use report::{PublishedPaths, artifact_stem, format_match_rate, publish, render_report};
 pub use table::Table;
