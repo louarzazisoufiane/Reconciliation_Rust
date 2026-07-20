@@ -41,6 +41,11 @@ export const api = {
       body: JSON.stringify({ ...draft, version: draft.version ?? 0 }),
     }),
 
+  deleteSchema: (name: string) =>
+    request<{ deleted: boolean }>(`/schemas/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+
   validateRun: (req: ValidateRunRequest) =>
     request<ValidateRunResponse>("/runs/validate", {
       method: "POST",

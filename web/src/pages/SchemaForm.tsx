@@ -83,8 +83,10 @@ export default function SchemaForm({ mode }: { mode: "create" | "edit" }) {
 
   return (
     <div>
-      <header className="mb-4">
-        <h1 className="text-2xl font-bold">{isEdit ? `Edit "${editName}"` : "Create schema"}</h1>
+      <header className="mb-5">
+        <h1 className="font-display text-2xl font-semibold text-[var(--fg)]">
+          {isEdit ? `Edit "${editName}"` : "Create schema"}
+        </h1>
         <div className="text-sm text-[var(--muted)]">
           Ordered fixed-width fields · start + length, zero-indexed by default
         </div>
@@ -92,7 +94,7 @@ export default function SchemaForm({ mode }: { mode: "create" | "edit" }) {
       {error && <ErrorBanner message={error} />}
 
       {!isEdit && (
-        <details className="mb-4 rounded-md border border-[var(--border)] p-3">
+        <details className="mb-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--shadow-sm)]">
           <summary className="cursor-pointer font-semibold">Infer a draft from a sample line</summary>
           <div className="mt-3">
             {draftNote && <WarnBanner message={draftNote} />}

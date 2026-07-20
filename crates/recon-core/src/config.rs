@@ -193,10 +193,8 @@ impl RunConfig {
         if self.compare_columns.is_empty() {
             return Err(ReconError::config("compare_columns must not be empty"));
         }
-        if !self.compare_columns.iter().any(|c| c == &self.key) {
-            // The key need not be compared, but it must never be absent from
-            // the pipeline; that is validated against schemas elsewhere.
-        }
+        // The key need not appear in `compare_columns`, but it must never be
+        // absent from the pipeline; that is validated against schemas elsewhere.
         // Normalization keys must reference real compare columns or the key.
         for col in self.normalization.keys() {
             if col != &self.key && !self.compare_columns.contains(col) {

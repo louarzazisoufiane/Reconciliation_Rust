@@ -40,6 +40,9 @@ pub trait SchemaStore: Send + Sync {
     /// Save `schema` as a NEW version (never overwrites). Returns the assigned
     /// version. The schema is validated first; hard validation errors abort.
     fn save(&self, schema: &Schema) -> ReconResult<u32>;
+    /// Delete a schema and ALL of its versions. Returns `true` if it existed,
+    /// `false` if there was nothing to remove.
+    fn delete(&self, name: &str) -> ReconResult<bool>;
     /// Resolve a [`SchemaRef`] to a concrete schema.
     fn resolve(&self, r: &SchemaRef) -> ReconResult<Schema> {
         self.get(&r.name, r.version)
@@ -194,6 +197,15 @@ impl SchemaStore for FsSchemaStore {
         std::fs::write(self.latest_file(&schema.name), next.to_string())?;
         Ok(next)
     }
+
+    fn delete(&self, name: &str) -> ReconResult<bool> {
+        let dir = self.schema_dir(name);
+        if !dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +256,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(resolved.version, 1);
+    }
+
+    #[test]
+    fn delete_removes_all_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsSchemaStore::new(dir.path());
+
+        store.save(&schema("customers", 2)).unwrap();
+        store.save(&schema("customers", 3)).unwrap();
+        assert!(store.exists("customers"));
+
+        // Deleting an existing schema wipes every version and reports true.
+        assert!(store.delete("customers").unwrap());
+        assert!(!store.exists("customers"));
+        assert_eq!(store.latest_version("customers").unwrap(), None);
+        assert!(store.list().unwrap().is_empty());
+
+        // Deleting again (or a never-existent name) is a no-op reporting false.
+        assert!(!store.delete("customers").unwrap());
     }
 }

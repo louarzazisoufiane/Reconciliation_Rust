@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let api = Router::new()
         .route("/schemas", get(schemas_list).post(schemas_create))
         .route("/schemas/infer", post(schemas_infer))
-        .route("/schemas/{name}", get(schemas_get))
+        .route("/schemas/{name}", get(schemas_get).delete(schemas_delete))
         .route("/runs", get(runs_list).post(runs_create))
         .route("/runs/validate", post(runs_validate))
         .with_state(state.clone());
@@ -163,6 +163,24 @@ async fn schemas_get(
         None => state.store.get_latest(&name)?,
     };
     Ok(Json(schema))
+}
+
+#[derive(Serialize)]
+struct SchemaDeleteResponse {
+    deleted: bool,
+}
+
+/// Delete a schema and all of its versions. 400 if no such schema exists.
+async fn schemas_delete(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<SchemaDeleteResponse>, AppError> {
+    if !state.store.delete(&name)? {
+        return Err(AppError(ReconError::config(format!(
+            "schema '{name}' not found"
+        ))));
+    }
+    Ok(Json(SchemaDeleteResponse { deleted: true }))
 }
 
 #[derive(Debug, Deserialize)]

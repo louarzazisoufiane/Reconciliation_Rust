@@ -18,4 +18,4 @@ polars.workspace = true
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml", "json"] }
-tempfile = "3"
+tempfile.workspace = true

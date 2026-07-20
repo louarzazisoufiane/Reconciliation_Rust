@@ -1,42 +1,93 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #0b0d10;
-  --fg: #e6e8eb;
-  --muted: #8b92a0;
-  --border: #23262b;
-  --head: #111418;
-  --accent: #4f8cff;
-  --pass: #35c46b;
-  --fail: #ff5c5c;
-  --diff-bg: #3a2e12;
-  --diff-fg: #e0b53f;
-  color-scheme: dark;
+  /* Anthropic-inspired: warm ivory + clay */
+  --bg: #f0eee6; /* signature ivory */
+  --surface: #faf9f5; /* warm off-white card */
+  --surface-2: #f4f2ea; /* subtle header/hover row */
+  --fg: #191917; /* warm near-black */
+  --muted: #73706a; /* warm gray */
+  --border: #e4e1d7; /* warm border */
+  --head: #f4f2ea; /* nav background */
+
+  --accent: #e8552b; /* vibrant terracotta-orange */
+  --accent-hover: #cf451d;
+  --accent-2: #f5824f; /* bright coral */
+  --accent-soft: #fce1d6; /* soft coral wash (active pills) */
+
+  --pass: #12a150; /* vibrant green */
+  --pass-soft: #d2f4df;
+  --fail: #e5341f; /* vibrant red */
+  --fail-soft: #fcdcd5;
+
+  --diff-bg: #ffe6a3;
+  --diff-fg: #9a6a00;
+
+  --shadow-sm: 0 1px 2px rgba(25, 25, 23, 0.05);
+  --shadow-md: 0 4px 16px rgba(25, 25, 23, 0.06), 0 1px 3px rgba(25, 25, 23, 0.04);
+
+  --font-display: ui-serif, "Georgia", "Times New Roman", serif;
+
+  color-scheme: light;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #ffffff;
-    --fg: #1a1d21;
-    --muted: #5c6470;
-    --border: #e2e5e9;
-    --head: #f7f8fa;
-    --accent: #2f6fed;
-    --pass: #1f8f4e;
-    --fail: #d7392f;
-    --diff-bg: #fff3cf;
-    --diff-fg: #8a6300;
-    color-scheme: light;
-  }
+html,
+body {
+  min-height: 100%;
 }
 
 body {
-  background: var(--bg);
   color: var(--fg);
+  background: var(--bg);
   font-family:
+    "Inter",
     system-ui,
     -apple-system,
     "Segoe UI",
     Roboto,
     sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Editorial serif display for page titles */
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+/* Global polish */
+a {
+  transition: color 0.15s ease;
+}
+
+button {
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s ease;
+}
+
+input,
+select,
+textarea {
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+tbody tr {
+  transition: background 0.12s ease;
+}
+
+tbody tr:hover {
+  background: var(--surface-2);
 }

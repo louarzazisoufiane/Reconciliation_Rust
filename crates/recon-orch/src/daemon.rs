@@ -1,10 +1,8 @@
-//! The orchestration drivers (ORCHESTRATION section).
+//! The watcher daemon (ORCHESTRATION section).
 //!
-//! Two drivers sit behind one [`Orchestrator`] seam:
-//!   * [`OneshotDriver`] runs the whole chain once (cron / systemd-timer / web).
-//!   * [`Daemon`] is a long-running watcher that, per configured pair, waits for
-//!     BOTH sources to complete (existence + size stability) and then runs the
-//!     same oneshot chain, handling retries/backoff itself.
+//! [`Daemon`] is a long-running watcher that, per configured pair, waits for
+//! BOTH sources to complete (existence + size stability) and then runs the
+//! oneshot chain, handling retries/backoff itself.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,43 +10,12 @@ use std::time::Duration;
 
 use recon_core::config::RunConfig;
 use recon_core::error::{ReconError, ReconResult};
-use recon_schema::{FsSchemaStore, SchemaStore};
+use recon_schema::FsSchemaStore;
 use tracing::{info, warn};
 
 use crate::dconfig::DaemonConfig;
 use crate::detector::{CompletionDetector, SizeStabilityDetector};
 use crate::pipeline::{generate_run_id, run_oneshot};
-
-/// The orchestration seam. Both the oneshot and daemon drivers implement it;
-/// the daemon additionally exposes an async [`Daemon::run`] loop.
-pub trait Orchestrator {
-    /// Drive the configured work. For oneshot this runs once and returns; the
-    /// daemon variant blocks until shutdown (see [`Daemon::run`]).
-    fn drive(&self) -> ReconResult<()>;
-}
-
-/// The oneshot driver: resolve schemas, compare, report, index — once.
-pub struct OneshotDriver<'a> {
-    /// The run configuration to execute.
-    pub config: &'a RunConfig,
-    /// Schema store used to resolve the two schema refs.
-    pub store: &'a dyn SchemaStore,
-    /// Explicit run id (generate one with [`generate_run_id`] if absent).
-    pub run_id: String,
-}
-
-impl Orchestrator for OneshotDriver<'_> {
-    fn drive(&self) -> ReconResult<()> {
-        let result = run_oneshot(self.config, self.store, &self.run_id)?;
-        info!(
-            run_id = %self.run_id,
-            report = %result.paths.report_html.display(),
-            pass = result.outcome.summary.pass,
-            "oneshot run complete"
-        );
-        Ok(())
-    }
-}
 
 /// The watcher daemon.
 pub struct Daemon {

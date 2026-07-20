@@ -264,7 +264,7 @@ pub fn run_comparison(
 
     // --- Capped samples for inline embedding --------------------------------
     let cap = config.report.embed_row_cap;
-    let samples = collect_samples(&joined, &key, &config.compare_columns, lf_a, lf_b, dup_keys_a, dup_keys_b, cap)?;
+    let samples = collect_samples(&joined, &key, &config.compare_columns, lf_a, lf_b, cap)?;
 
     let denom = matched + only_in_a + only_in_b + changed;
     let match_rate = if denom == 0 { 1.0 } else { matched as f64 / denom as f64 };
@@ -490,8 +490,6 @@ fn collect_samples(
     compares: &[String],
     lf_a: LazyFrame,
     lf_b: LazyFrame,
-    dup_keys_a: LazyFrame,
-    dup_keys_b: LazyFrame,
     cap: usize,
 ) -> ReconResult<Samples> {
     let cap_u = cap as u32;
@@ -549,14 +547,12 @@ fn collect_samples(
         .filter(col("count").gt(lit(1u32)))
         .with_column(lit("A").alias("side"))
         .select([col(key), col("side"), col("count")]);
-    let _ = &dup_keys_a;
     let dup_b = lf_b
         .group_by([col(key)])
         .agg([len().alias("count")])
         .filter(col("count").gt(lit(1u32)))
         .with_column(lit("B").alias("side"))
         .select([col(key), col("side"), col("count")]);
-    let _ = &dup_keys_b;
     let duplicates = concat([dup_a, dup_b], UnionArgs::default())
         .map_err(|e| ReconError::engine(e.to_string()))?
         .limit(cap_u)

@@ -2554,21 +2554,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "recon-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "jiff",
- "recon-core",
- "recon-orch",
- "recon-report",
- "recon-schema",
- "tempfile",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "recon-core"
 version = "0.1.0"
 dependencies = [

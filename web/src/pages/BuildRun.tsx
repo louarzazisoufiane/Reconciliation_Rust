@@ -117,13 +117,17 @@ export default function BuildRun() {
   if (success) {
     return (
       <div>
-        <h1 className="text-2xl font-bold">Run complete</h1>
-        <p className="my-3 font-semibold text-[var(--pass)]">Reconciliation finished.</p>
-        <p className="flex gap-3">
-          <a className="text-[var(--accent)]" href={success.reportUrl}>
+        <h1 className="font-display text-2xl font-semibold text-[var(--fg)]">
+          Run complete
+        </h1>
+        <p className="my-3 inline-flex items-center gap-2 rounded-lg bg-[var(--pass-soft)] px-3 py-2 font-semibold text-[var(--pass)]">
+          ✓ Reconciliation finished.
+        </p>
+        <p className="flex gap-4">
+          <a className="font-semibold text-[var(--accent)] hover:underline" href={success.reportUrl}>
             Open report →
           </a>
-          <Link className="text-[var(--accent)]" to="/runs">
+          <Link className="font-semibold text-[var(--accent)] hover:underline" to="/runs">
             View all runs
           </Link>
         </p>
@@ -133,8 +137,10 @@ export default function BuildRun() {
 
   return (
     <div>
-      <header className="mb-4">
-        <h1 className="text-2xl font-bold">Build a run</h1>
+      <header className="mb-5">
+        <h1 className="font-display text-2xl font-semibold text-[var(--fg)]">
+          Build a run
+        </h1>
         <div className="text-sm text-[var(--muted)]">
           {step === 1 ? "Step 1 — sources & schemas" : `Step 2 — key, columns & normalization for "${runName}"`}
         </div>
@@ -145,7 +151,7 @@ export default function BuildRun() {
         (schemas && schemas.length === 0 ? (
           <p className="text-[var(--muted)]">
             No schemas yet.{" "}
-            <Link className="text-[var(--accent)]" to="/schemas/new">
+            <Link className="font-semibold text-[var(--accent)] hover:underline" to="/schemas/new">
               Create one first.
             </Link>
           </p>
@@ -174,7 +180,7 @@ export default function BuildRun() {
             <select
               id="schema_a"
               required
-              className="min-w-[220px] rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-sm"
+              className="min-w-[220px] rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--fg)] shadow-[var(--shadow-sm)]"
               value={schemaA}
               onChange={(e) => setSchemaA(e.target.value)}
             >
@@ -201,7 +207,7 @@ export default function BuildRun() {
             <select
               id="schema_b"
               required
-              className="min-w-[220px] rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-sm"
+              className="min-w-[220px] rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--fg)] shadow-[var(--shadow-sm)]"
               value={schemaB}
               onChange={(e) => setSchemaB(e.target.value)}
             >
@@ -228,52 +234,52 @@ export default function BuildRun() {
           </p>
           <TableWrap>
             <thead>
-              <tr className="border-b border-[var(--border)] text-center">
-                <th className="p-2 text-left">Column</th>
-                <th className="p-2">Key</th>
-                <th className="p-2">Compare</th>
-                <th className="p-2">trim</th>
-                <th className="p-2">strip_leading_zeros</th>
-                <th className="p-2">unify_null</th>
-                <th className="p-2">case_fold</th>
+              <tr className="border-b border-[var(--border)] bg-[var(--surface-2)] text-center text-xs uppercase tracking-wide text-[var(--muted)]">
+                <th className="p-3 text-left">Column</th>
+                <th className="p-3">Key</th>
+                <th className="p-3">Compare</th>
+                <th className="p-3">trim</th>
+                <th className="p-3">strip_leading_zeros</th>
+                <th className="p-3">unify_null</th>
+                <th className="p-3">case_fold</th>
               </tr>
             </thead>
             <tbody>
               {commonColumns.map((c) => (
                 <tr key={c} className="border-b border-[var(--border)] text-center last:border-0">
-                  <td className="p-2 text-left">{c}</td>
-                  <td className="p-2">
+                  <td className="p-3 text-left font-medium">{c}</td>
+                  <td className="p-3">
                     <input type="radio" name="key" checked={key === c} onChange={() => setKey(c)} />
                   </td>
-                  <td className="p-2">
+                  <td className="p-3">
                     <input
                       type="checkbox"
                       checked={toggles[c]?.compare ?? false}
                       onChange={(e) => updateToggle(c, { compare: e.target.checked })}
                     />
                   </td>
-                  <td className="p-2">
+                  <td className="p-3">
                     <input
                       type="checkbox"
                       checked={toggles[c]?.trim ?? false}
                       onChange={(e) => updateToggle(c, { trim: e.target.checked })}
                     />
                   </td>
-                  <td className="p-2">
+                  <td className="p-3">
                     <input
                       type="checkbox"
                       checked={toggles[c]?.strip_leading_zeros ?? false}
                       onChange={(e) => updateToggle(c, { strip_leading_zeros: e.target.checked })}
                     />
                   </td>
-                  <td className="p-2">
+                  <td className="p-3">
                     <input
                       type="checkbox"
                       checked={toggles[c]?.unify_null ?? false}
                       onChange={(e) => updateToggle(c, { unify_null: e.target.checked })}
                     />
                   </td>
-                  <td className="p-2">
+                  <td className="p-3">
                     <input
                       type="checkbox"
                       checked={toggles[c]?.case_fold ?? false}

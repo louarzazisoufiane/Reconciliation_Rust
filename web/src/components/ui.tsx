@@ -6,14 +6,19 @@ import type {
 } from "react";
 
 export function Label(props: LabelHTMLAttributes<HTMLLabelElement>) {
-  return <label {...props} className="mb-1 mt-3 block text-[13px] font-semibold" />;
+  return (
+    <label
+      {...props}
+      className="mb-1 mt-3 block text-[13px] font-semibold text-[var(--fg)]"
+    />
+  );
 }
 
 export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
       {...props}
-      className={`min-w-[220px] rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-sm text-[var(--fg)] ${props.className ?? ""}`}
+      className={`min-w-[220px] rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--fg)] shadow-[var(--shadow-sm)] placeholder:text-[var(--muted)] ${props.className ?? ""}`}
     />
   );
 }
@@ -27,8 +32,8 @@ export function Button({
       {...props}
       className={
         secondary
-          ? "cursor-pointer rounded-md border border-[var(--accent)] bg-transparent px-3.5 py-2 text-sm font-semibold text-[var(--accent)]"
-          : "cursor-pointer rounded-md border border-[var(--accent)] bg-[var(--accent)] px-3.5 py-2 text-sm font-semibold text-white disabled:opacity-50"
+          ? "cursor-pointer rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold text-[var(--fg)] shadow-[var(--shadow-sm)] hover:bg-[var(--surface-2)] disabled:opacity-50"
+          : "cursor-pointer rounded-lg border-0 bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-[var(--shadow-sm)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
       }
     />
   );
@@ -36,7 +41,7 @@ export function Button({
 
 export function TableWrap({ children }: { children: ReactNode }) {
   return (
-    <div className="overflow-x-auto rounded-md border border-[var(--border)]">
+    <div className="overflow-x-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-md)]">
       <table className="w-full border-collapse text-sm">{children}</table>
     </div>
   );

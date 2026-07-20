@@ -6,21 +6,35 @@ import BuildRun from "./pages/BuildRun";
 import RunsList from "./pages/RunsList";
 
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
-  `font-semibold no-underline ${isActive ? "text-[var(--accent)]" : "text-[var(--fg)]"}`;
+  `rounded-lg px-3 py-1.5 text-sm font-semibold no-underline transition-colors ${
+    isActive
+      ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+      : "text-[var(--muted)] hover:text-[var(--fg)]"
+  }`;
 
 export default function App() {
   return (
     <div className="min-h-screen">
-      <nav className="flex gap-6 border-b border-[var(--border)] bg-[var(--head)] px-6 py-3">
-        <NavLink to="/schemas" className={navLinkClass}>
-          Schemas
-        </NavLink>
-        <NavLink to="/runs/new" className={navLinkClass}>
-          Build run
-        </NavLink>
-        <NavLink to="/runs" className={navLinkClass}>
-          Runs
-        </NavLink>
+      <nav className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--head)]/85 backdrop-blur-md">
+        <div className="mx-auto flex max-w-5xl items-center gap-6 px-6 py-3">
+          <span className="flex items-center gap-2 font-semibold tracking-tight">
+            <span className="grid h-7 w-7 place-items-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--shadow-sm)]">
+              ⇄
+            </span>
+            <span className="font-display text-[var(--fg)]">Reconcile</span>
+          </span>
+          <div className="flex gap-1">
+            <NavLink to="/schemas" className={navLinkClass}>
+              Schemas
+            </NavLink>
+            <NavLink to="/runs/new" className={navLinkClass}>
+              Build run
+            </NavLink>
+            <NavLink to="/runs" className={navLinkClass}>
+              Runs
+            </NavLink>
+          </div>
+        </div>
       </nav>
       <main className="mx-auto max-w-5xl px-6 py-8">
         <Routes>

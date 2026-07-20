@@ -22,8 +22,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use polars::prelude::{
-    Column, DataFrame, DataType, LazyFrame, ParquetWriter, PlPath, PlSmallStr, PolarsResult,
-    ScanArgsParquet, Schema as PlSchema,
+    Column, DataFrame, DataType, IntoColumn, LazyFrame, ParquetWriter, PlPath, PlSmallStr,
+    PolarsResult, ScanArgsParquet, Schema as PlSchema, StringChunkedBuilder,
 };
 
 use crate::error::{ReconError, ReconResult};
@@ -97,9 +97,18 @@ fn read_fixed_width_batched(
         })
         .collect();
 
-    let ncols = schema.fields.len();
     let mut writer = ParquetWriter::new(tmp.as_file_mut()).batched(&pl_schema)?;
-    let mut columns: Vec<Vec<String>> = vec![Vec::new(); ncols];
+    // One string builder per column. Field slices are appended straight into a
+    // contiguous buffer, so a batch costs a handful of buffer growths instead of
+    // one heap `String` per cell (~31M allocations on a 1.3M-row × 24-col file).
+    // The reserve is capped so a `usize::MAX` batch size (single-batch tests)
+    // does not request an enormous up-front allocation.
+    let init_cap = batch_rows.min(STAGE_BATCH_ROWS);
+    let mut columns: Vec<StringChunkedBuilder> = schema
+        .fields
+        .iter()
+        .map(|f| StringChunkedBuilder::new(PlSmallStr::from_str(&f.name), init_cap))
+        .collect();
     let mut pending = 0usize;
     let mut buf: Vec<u8> = Vec::new();
 
@@ -125,16 +134,16 @@ fn read_fixed_width_batched(
             let start = range.start.min(line.len());
             let end = range.end.min(line.len());
             let slice = if start < end { &line[start..end] } else { &[][..] };
-            columns[idx].push(String::from_utf8_lossy(slice).into_owned());
+            columns[idx].append_value(String::from_utf8_lossy(slice).as_ref());
         }
         pending += 1;
         if pending == batch_rows {
-            write_batch(&mut writer, schema, &mut columns)?;
+            write_batch(&mut writer, schema, &mut columns, init_cap)?;
             pending = 0;
         }
     }
     if pending > 0 {
-        write_batch(&mut writer, schema, &mut columns)?;
+        write_batch(&mut writer, schema, &mut columns, init_cap)?;
     }
     writer.finish()?;
     drop(writer);
@@ -147,19 +156,22 @@ fn read_fixed_width_batched(
     Ok(FixedWidthSource { lazy, staged })
 }
 
-/// Flush the accumulated batch to the staging Parquet writer, leaving the
-/// column buffers empty for the next batch.
+/// Flush the accumulated batch to the staging Parquet writer, resetting each
+/// column builder to an empty one for the next batch.
 fn write_batch<W: std::io::Write>(
     writer: &mut polars::io::parquet::write::BatchedWriter<W>,
     schema: &Schema,
-    columns: &mut [Vec<String>],
+    columns: &mut [StringChunkedBuilder],
+    init_cap: usize,
 ) -> ReconResult<()> {
     let series: Vec<Column> = schema
         .fields
         .iter()
         .zip(columns.iter_mut())
-        .map(|(field, values)| {
-            Column::new(PlSmallStr::from_str(&field.name), std::mem::take(values))
+        .map(|(field, builder)| {
+            let name = PlSmallStr::from_str(&field.name);
+            let done = std::mem::replace(builder, StringChunkedBuilder::new(name, init_cap));
+            done.finish().into_column()
         })
         .collect();
     let df = DataFrame::new(series)?;
