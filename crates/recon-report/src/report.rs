@@ -102,11 +102,21 @@ pub fn render_report(summary: &Summary, outcome: &ReconOutcome) -> ReconResult<S
                 style { (PreEscaped(assets::STYLE)) }
             }
             body {
-                header {
-                    h1 { (summary.run_name) " " span.badge.(badge_class) { (badge_text) } }
-                    div.sub { "run " (summary.run_id) " · " (summary.timestamp) }
+                nav.topbar {
+                    div.topbar-inner {
+                        span.brand-mark { "⇄" }
+                        span.brand { "Reconcile" }
+                        span.nav-label { "Run report" }
+                    }
                 }
                 main {
+                    header.report-header {
+                        div {
+                            h1 { (summary.run_name) }
+                            div.sub { "run " (summary.run_id) " · " (summary.timestamp) }
+                        }
+                        span.badge.(badge_class) { "● " (badge_text) }
+                    }
                     div.cards {
                         (stat_card("Rows A", summary.rows_a))
                         (stat_card("Rows B", summary.rows_b))
@@ -131,27 +141,29 @@ pub fn render_report(summary: &Summary, outcome: &ReconOutcome) -> ReconResult<S
                         dt { "Embed cap" } dd { (summary.embed_row_cap) " rows/category" }
                     }
 
-                    h2 { "Changed " span.count { "(" (summary.changed) ")" } }
+                    h2.section-heading { "Changed " span.count { "(" (summary.changed) ")" } }
                     div #t-changed {}
 
-                    h2 { "Only in A " span.count { "(" (summary.only_in_a) ")" } }
+                    h2.section-heading { "Only in A " span.count { "(" (summary.only_in_a) ")" } }
                     div #t-only-a {}
 
-                    h2 { "Only in B " span.count { "(" (summary.only_in_b) ")" } }
+                    h2.section-heading { "Only in B " span.count { "(" (summary.only_in_b) ")" } }
                     div #t-only-b {}
 
-                    h2 { "Duplicate keys " span.count { "(A: " (summary.dup_keys_a) ", B: " (summary.dup_keys_b) ")" } }
+                    h2.section-heading { "Duplicate keys " span.count { "(A: " (summary.dup_keys_a) ", B: " (summary.dup_keys_b) ")" } }
                     div #t-duplicates {}
                 }
                 footer {
-                    p {
-                        "Completion detection: file-size stability over "
-                        (summary.stability_minutes)
-                        " min. CAVEAT — a writer stalled longer than this window mid-write can look \"done\" and cause a partial-file comparison."
-                    }
-                    p {
-                        "Embedded rows are capped at " (summary.embed_row_cap)
-                        " per category; the linked Parquet sidecar holds the complete, uncapped diff."
+                    div.footer-inner {
+                        p {
+                            "Completion detection: file-size stability over "
+                            (summary.stability_minutes)
+                            " min. CAVEAT — a writer stalled longer than this window mid-write can look \"done\" and cause a partial-file comparison."
+                        }
+                        p {
+                            "Embedded rows are capped at " (summary.embed_row_cap)
+                            " per category; the linked Parquet sidecar holds the complete, uncapped diff."
+                        }
                     }
                 }
                 script #recon-data type="application/json" { (PreEscaped(island)) }

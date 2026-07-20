@@ -238,13 +238,13 @@ pub fn run_comparison(
     let category = category_expr(&config.compare_columns);
     let joined = joined.with_columns([category.alias("__category")]);
 
-    // --- Category counts (small aggregation; never materializes the diff) ----
-    let counts = joined
-        .clone()
-        .group_by([col("__category")])
-        .agg([len().alias("n")])
-        .collect_with_engine(Engine::Streaming)?;
-    let cat = |name: &str| category_count(&counts, name);
+    // --- Category counts + capped joined samples -----------------------------
+    // One grouped streaming query replaces the former count query plus the
+    // three per-category sample queries. It retains at most `cap` rows for
+    // each category, never the full joined diff.
+    let cap = config.report.embed_row_cap;
+    let category_rows = collect_category_rows(&joined, &key, &config.compare_columns, cap)?;
+    let cat = |name: &str| category_count(&category_rows, name);
     let only_in_a = cat("only_in_a");
     let only_in_b = cat("only_in_b");
     let changed = cat("changed");
@@ -263,8 +263,7 @@ pub fn run_comparison(
     write_sidecar(unified, sidecar_path)?;
 
     // --- Capped samples for inline embedding --------------------------------
-    let cap = config.report.embed_row_cap;
-    let samples = collect_samples(&joined, &key, &config.compare_columns, lf_a, lf_b, cap)?;
+    let samples = collect_samples(category_rows, &key, &config.compare_columns, lf_a, lf_b, cap)?;
 
     let denom = matched + only_in_a + only_in_b + changed;
     let match_rate = if denom == 0 { 1.0 } else { matched as f64 / denom as f64 };
@@ -482,62 +481,111 @@ fn write_sidecar(lf: LazyFrame, path: &Path) -> ReconResult<()> {
     Ok(())
 }
 
+/// Collect category counts and at most `cap` joined rows per category.
+///
+/// The aggregation collects only list values capped by `head(cap)`. Exploding
+/// those lists afterwards is eager and bounded by the configured cap.
+fn collect_category_rows(
+    joined: &LazyFrame,
+    key: &str,
+    compares: &[String],
+    cap: usize,
+) -> ReconResult<DataFrame> {
+    let mut sample_columns = vec![key.to_string()];
+    for c in compares {
+        sample_columns.push(format!("{c}{A}"));
+        sample_columns.push(format!("{c}{B}"));
+    }
+
+    let mut aggs = vec![len().alias("n")];
+    aggs.extend(
+        sample_columns
+            .iter()
+            .map(|name| col(name.as_str()).head(Some(cap)).alias(name)),
+    );
+
+    let grouped = joined
+        .clone()
+        .group_by([col("__category")])
+        .agg(aggs)
+        .collect_with_engine(Engine::Streaming)?;
+
+    // `n` remains scalar; every list has the same per-category length, so a
+    // multi-column explode recreates the capped joined rows without another
+    // lazy execution.
+    Ok(grouped.explode(sample_columns)?)
+}
+
+/// Extract one category from capped joined rows and select its report schema.
+fn sample_category(
+    rows: &DataFrame,
+    category: &str,
+    columns: Vec<String>,
+    renames: &[(String, String)],
+) -> ReconResult<DataFrame> {
+    let mask = rows.column("__category")?.str()?.equal(category);
+    let filtered = rows.filter(&mask)?;
+    let mut sample = DataFrame::new(filtered.select_columns(columns)?)?;
+    for (from, to) in renames {
+        sample.rename(from, to.clone().into())?;
+    }
+    Ok(sample)
+}
+
 /// Collect capped per-category samples for inline embedding.
 #[allow(clippy::too_many_arguments)]
 fn collect_samples(
-    joined: &LazyFrame,
+    category_rows: DataFrame,
     key: &str,
     compares: &[String],
     lf_a: LazyFrame,
     lf_b: LazyFrame,
     cap: usize,
 ) -> ReconResult<Samples> {
-    let cap_u = cap as u32;
+    // Exploding an empty list yields one null row per group. Trim that eager
+    // representation back to zero rows so `embed_row_cap = 0` keeps its
+    // existing meaning.
+    let category_rows = if cap == 0 {
+        category_rows.head(Some(0))
+    } else {
+        category_rows
+    };
 
     // only_in_a: key + compare cols (A-side values, renamed back to plain names).
     // Skip the key in the compare loop when it equals the key to avoid duplicating
     // the column name (the key is already selected via `col(key)` above).
     let only_a = {
-        let mut exprs = vec![col(key)];
+        let mut columns = vec![key.to_string()];
+        let mut renames = Vec::new();
         for c in compares {
             if c == key { continue; }
-            exprs.push(col(format!("{c}{A}")).alias(c.as_str()));
+            let source = format!("{c}{A}");
+            columns.push(source.clone());
+            renames.push((source, c.clone()));
         }
-        joined
-            .clone()
-            .filter(col("__category").eq(lit("only_in_a")))
-            .select(exprs)
-            .limit(cap_u)
-            .collect_with_engine(Engine::Streaming)?
+        sample_category(&category_rows, "only_in_a", columns, &renames)?
     };
 
     let only_b = {
-        let mut exprs = vec![col(key)];
+        let mut columns = vec![key.to_string()];
+        let mut renames = Vec::new();
         for c in compares {
             if c == key { continue; }
-            exprs.push(col(format!("{c}{B}")).alias(c.as_str()));
+            let source = format!("{c}{B}");
+            columns.push(source.clone());
+            renames.push((source, c.clone()));
         }
-        joined
-            .clone()
-            .filter(col("__category").eq(lit("only_in_b")))
-            .select(exprs)
-            .limit(cap_u)
-            .collect_with_engine(Engine::Streaming)?
+        sample_category(&category_rows, "only_in_b", columns, &renames)?
     };
 
     // changed: full row, both sides, per compared column.
     let changed = {
-        let mut exprs = vec![col(key)];
+        let mut columns = vec![key.to_string()];
         for c in compares {
-            exprs.push(col(format!("{c}{A}")));
-            exprs.push(col(format!("{c}{B}")));
+            columns.push(format!("{c}{A}"));
+            columns.push(format!("{c}{B}"));
         }
-        joined
-            .clone()
-            .filter(col("__category").eq(lit("changed")))
-            .select(exprs)
-            .limit(cap_u)
-            .collect_with_engine(Engine::Streaming)?
+        sample_category(&category_rows, "changed", columns, &[])?
     };
 
     // duplicates: key, side, count.
@@ -555,7 +603,7 @@ fn collect_samples(
         .select([col(key), col("side"), col("count")]);
     let duplicates = concat([dup_a, dup_b], UnionArgs::default())
         .map_err(|e| ReconError::engine(e.to_string()))?
-        .limit(cap_u)
+        .limit(cap as u32)
         .collect_with_engine(Engine::Streaming)?;
 
     Ok(Samples {
@@ -705,5 +753,45 @@ mod tests {
             df.get_column_names_str(),
             vec!["id", "name__a", "name__b", "__category"]
         );
+    }
+
+    #[test]
+    fn grouped_category_samples_keep_counts_and_apply_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_source(dir.path(), "a.txt", "001Alice\n002Bob  \n003Carol\n");
+        let b = write_source(dir.path(), "b.txt", "");
+        let mut cfg = config(dir.path(), a, b);
+        cfg.report.embed_row_cap = 2;
+
+        let outcome = run_comparison(
+            &cfg,
+            &schema(),
+            &schema(),
+            "run-capped-samples",
+            jiff::Timestamp::now(),
+            &dir.path().join("diff.parquet"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.summary.only_in_a, 3);
+        assert_eq!(outcome.samples.only_in_a.height(), 2);
+        assert_eq!(outcome.samples.only_in_a.get_column_names_str(), vec!["id", "name"]);
+        assert!(outcome.samples.only_in_b.is_empty());
+        assert!(outcome.samples.changed.is_empty());
+
+        cfg.report.embed_row_cap = 0;
+        let zero_cap = run_comparison(
+            &cfg,
+            &schema(),
+            &schema(),
+            "run-zero-cap",
+            jiff::Timestamp::now(),
+            &dir.path().join("zero-cap.parquet"),
+        )
+        .unwrap();
+        assert_eq!(zero_cap.summary.only_in_a, 3);
+        assert!(zero_cap.samples.only_in_a.is_empty());
+        assert!(zero_cap.samples.only_in_b.is_empty());
+        assert!(zero_cap.samples.changed.is_empty());
     }
 }

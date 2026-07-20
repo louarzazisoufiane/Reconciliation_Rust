@@ -23,11 +23,20 @@ pub fn render_index(entries: &[ManifestEntry]) -> String {
                 style { (PreEscaped(assets::STYLE)) }
             }
             body {
-                header {
-                    h1 { "Reconciliation history" }
-                    div.sub { (entries.len()) " run(s) · newest first" }
+                nav.topbar {
+                    div.topbar-inner {
+                        span.brand-mark { "⇄" }
+                        span.brand { "Reconcile" }
+                        span.nav-label { "Run history" }
+                    }
                 }
                 main {
+                    header.report-header {
+                        div {
+                            h1 { "Reconciliation history" }
+                            div.sub { (entries.len()) " run(s) · newest first" }
+                        }
+                    }
                     input #q.filter placeholder="Filter runs…";
                     @if rows.is_empty() {
                         p.empty { "No runs yet." }
@@ -58,7 +67,9 @@ pub fn render_index(entries: &[ManifestEntry]) -> String {
                     }
                 }
                 footer {
-                    p { "Static index — no server required. Regenerated from manifest.json on every run." }
+                    div.footer-inner {
+                        p { "Static index — no server required. Regenerated from manifest.json on every run." }
+                    }
                 }
                 script { (PreEscaped(assets::INDEX_JS)) }
             }

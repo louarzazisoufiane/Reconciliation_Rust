@@ -76,6 +76,21 @@ export default function BuildRun() {
     setToggles((prev) => ({ ...prev, [col]: { ...prev[col], ...patch } }));
   }
 
+  function toggleEntireColumn(field: keyof ColumnToggles, checked: boolean) {
+    setToggles((prev) =>
+      Object.fromEntries(
+        commonColumns.map((column) => [
+          column,
+          { ...prev[column], [field]: checked },
+        ]),
+      ),
+    );
+  }
+
+  function entireColumnChecked(field: keyof ColumnToggles) {
+    return commonColumns.length > 0 && commonColumns.every((column) => toggles[column]?.[field] ?? false);
+  }
+
   async function onStep2Submit(e: FormEvent) {
     e.preventDefault();
     setError(null);
@@ -237,11 +252,31 @@ export default function BuildRun() {
               <tr className="border-b border-[var(--border)] bg-[var(--surface-2)] text-center text-xs uppercase tracking-wide text-[var(--muted)]">
                 <th className="p-3 text-left">Column</th>
                 <th className="p-3">Key</th>
-                <th className="p-3">Compare</th>
-                <th className="p-3">trim</th>
-                <th className="p-3">strip_leading_zeros</th>
-                <th className="p-3">unify_null</th>
-                <th className="p-3">case_fold</th>
+                <ToggleColumnHeader
+                  label="Compare"
+                  checked={entireColumnChecked("compare")}
+                  onChange={(checked) => toggleEntireColumn("compare", checked)}
+                />
+                <ToggleColumnHeader
+                  label="trim"
+                  checked={entireColumnChecked("trim")}
+                  onChange={(checked) => toggleEntireColumn("trim", checked)}
+                />
+                <ToggleColumnHeader
+                  label="strip_leading_zeros"
+                  checked={entireColumnChecked("strip_leading_zeros")}
+                  onChange={(checked) => toggleEntireColumn("strip_leading_zeros", checked)}
+                />
+                <ToggleColumnHeader
+                  label="unify_null"
+                  checked={entireColumnChecked("unify_null")}
+                  onChange={(checked) => toggleEntireColumn("unify_null", checked)}
+                />
+                <ToggleColumnHeader
+                  label="case_fold"
+                  checked={entireColumnChecked("case_fold")}
+                  onChange={(checked) => toggleEntireColumn("case_fold", checked)}
+                />
               </tr>
             </thead>
             <tbody>
@@ -301,5 +336,29 @@ export default function BuildRun() {
         </form>
       )}
     </div>
+  );
+}
+
+function ToggleColumnHeader({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <th className="p-3">
+      <label className="inline-flex cursor-pointer items-center gap-1.5" title={`Toggle all ${label} values`}>
+        <input
+          type="checkbox"
+          aria-label={`Toggle all ${label} values`}
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        <span>{label}</span>
+      </label>
+    </th>
   );
 }
