@@ -10,19 +10,20 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{
-    FromRow, PgPool,
-    postgres::{PgConnectOptions, PgPoolCopyExt, PgPoolOptions},
+    FromRow, PgPool, Postgres, QueryBuilder,
+    postgres::{PgConnectOptions, PgPoolOptions},
 };
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
-const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const INSERT_BATCH_SIZE: usize = 1_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -49,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { pool };
     let api = Router::new()
         .route("/layouts", get(list_layouts).post(create_layout))
-        .route("/comparisons", post(create_comparison))
+        .route(
+            "/comparisons",
+            get(list_comparisons).post(create_comparison),
+        )
         .route("/comparisons/{id}/delta", get(list_delta))
         .with_state(state);
     // Multipart is streamed and rows are batched below; do not impose Axum's
@@ -191,6 +195,31 @@ struct ComparisonResponse {
     modified: i64,
 }
 
+#[derive(Serialize, FromRow)]
+struct ComparisonHistoryRow {
+    id: Uuid,
+    run_index: i64,
+    run_name: String,
+    created_at: String,
+    processing_duration_ms: Option<i64>,
+    processing_started_at: Option<String>,
+    processing_completed_at: Option<String>,
+    old_layout_name: String,
+    new_layout_name: String,
+    old_date_of_download: Option<String>,
+    new_date_of_download: Option<String>,
+    old_origin_file_name: Option<String>,
+    new_origin_file_name: Option<String>,
+}
+
+async fn list_comparisons(State(state): State<AppState>) -> ApiResult<Vec<ComparisonHistoryRow>> {
+    Ok(Json(sqlx::query_as(
+        "SELECT run.id, run.run_index, run.run_name, run.created_at::text AS created_at, run.processing_duration_ms, run.processing_started_at::text AS processing_started_at, run.processing_completed_at::text AS processing_completed_at, old_layout.name AS old_layout_name, new_layout.name AS new_layout_name, run.old_date_of_download::text AS old_date_of_download, run.new_date_of_download::text AS new_date_of_download, run.old_origin_file_name, run.new_origin_file_name FROM comparison_runs run JOIN layouts old_layout ON old_layout.id = run.old_layout_id JOIN layouts new_layout ON new_layout.id = run.new_layout_id ORDER BY run.created_at DESC",
+    )
+    .fetch_all(&state.pool)
+    .await?))
+}
+
 async fn create_comparison(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -201,7 +230,10 @@ async fn create_comparison(
     let mut new_date = None;
     let mut old_origin_file_name = None;
     let mut new_origin_file_name = None;
+    let mut run_name = None;
+    let mut processing_started_at = None;
     let mut comparison_id = None;
+    let mut run_index = None;
     let mut old_rows = None;
     let mut new_rows = None;
     while let Some(field) = multipart.next_field().await? {
@@ -213,6 +245,8 @@ async fn create_comparison(
             "new_date_of_download" => new_date = Some(field.text().await?),
             "old_origin_file_name" => old_origin_file_name = Some(field.text().await?),
             "new_origin_file_name" => new_origin_file_name = Some(field.text().await?),
+            "run_name" => run_name = Some(field.text().await?),
+            "processing_started_at" => processing_started_at = Some(field.text().await?),
             "old_file" | "new_file" => {
                 let old_id = old_layout_id
                     .ok_or_else(|| anyhow::anyhow!("send layout selections before files"))?;
@@ -234,24 +268,29 @@ async fn create_comparison(
                         let new_file_name = new_origin_file_name.as_deref().ok_or_else(|| {
                             anyhow::anyhow!("send new file metadata before files")
                         })?;
-                        sqlx::query("INSERT INTO comparison_runs (id, old_layout_id, new_layout_id, old_date_of_download, old_origin_file_name, new_date_of_download, new_origin_file_name) VALUES ($1, $2, $3, $4::timestamptz, $5, $6::timestamptz, $7)")
-                            .bind(id).bind(old_id).bind(new_id).bind(old_date).bind(old_file_name).bind(new_date).bind(new_file_name)
-                            .execute(&state.pool).await?;
+                        let run_name = run_name
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .ok_or_else(|| anyhow::anyhow!("run name is required"))?;
+                        let processing_started_at = processing_started_at
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("processing start time is required"))?;
+                        let index: i64 = sqlx::query_scalar("INSERT INTO comparison_runs (id, run_name, old_layout_id, new_layout_id, old_date_of_download, old_origin_file_name, new_date_of_download, new_origin_file_name, processing_started_at) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7::timestamptz, $8, $9::timestamptz) RETURNING run_index")
+                            .bind(id).bind(run_name).bind(old_id).bind(new_id).bind(old_date).bind(old_file_name).bind(new_date).bind(new_file_name).bind(processing_started_at)
+                            .fetch_one(&state.pool).await?;
+                        create_source_tables(&state.pool, index).await?;
                         comparison_id = Some(id);
+                        run_index = Some(index);
                         id
                     }
                 };
                 let is_old = name == "old_file";
                 let layout =
                     fetch_layout(&state.pool, if is_old { old_id } else { new_id }).await?;
-                let count = stream_load(
-                    &state.pool,
-                    field,
-                    if is_old { "old_rows" } else { "new_rows" },
-                    id,
-                    &layout,
-                )
-                .await?;
+                let index = run_index.ok_or_else(|| anyhow::anyhow!("run index is missing"))?;
+                let table = source_table_name(is_old, index);
+                let count = stream_load(&state.pool, field, &table, id, index, &layout).await?;
                 if is_old {
                     old_rows = Some(count);
                 } else {
@@ -265,18 +304,24 @@ async fn create_comparison(
     let new_layout_id = new_layout_id.ok_or_else(|| anyhow::anyhow!("new layout is required"))?;
     let _ = (old_layout_id, new_layout_id);
     let comparison_id = comparison_id.ok_or_else(|| anyhow::anyhow!("both files are required"))?;
+    let run_index = run_index.ok_or_else(|| anyhow::anyhow!("run index is required"))?;
     let old_rows = old_rows.ok_or_else(|| anyhow::anyhow!("old file is required"))?;
     let new_rows = new_rows.ok_or_else(|| anyhow::anyhow!("new file is required"))?;
-    compute_delta(&state.pool, comparison_id).await?;
+    compute_delta(&state.pool, comparison_id, run_index).await?;
+    sqlx::query("UPDATE comparison_runs SET processing_completed_at = now(), processing_duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - processing_started_at)) * 1000)::BIGINT) WHERE id = $1")
+        .bind(comparison_id)
+        .execute(&state.pool)
+        .await?;
     let counts = sqlx::query_as::<_, DeltaCount>("SELECT count(*) FILTER (WHERE change_type = 'added') AS added, count(*) FILTER (WHERE change_type = 'removed') AS removed, count(*) FILTER (WHERE change_type = 'modified') AS modified FROM delta_rows WHERE comparison_id = $1").bind(comparison_id).fetch_one(&state.pool).await?;
-    Ok(Json(ComparisonResponse {
+    let response = ComparisonResponse {
         id: comparison_id,
         old_rows,
         new_rows,
         added: counts.added.unwrap_or(0),
         removed: counts.removed.unwrap_or(0),
         modified: counts.modified.unwrap_or(0),
-    }))
+    };
+    Ok(Json(response))
 }
 
 fn parse_uuid(value: String) -> anyhow::Result<Uuid> {
@@ -293,25 +338,39 @@ async fn fetch_layout(pool: &PgPool, id: Uuid) -> anyhow::Result<Vec<LayoutField
     Ok(fields.0)
 }
 
+fn source_table_name(is_old: bool, run_index: i64) -> String {
+    let prefix = if is_old { "old_rows" } else { "new_rows" };
+    format!("{prefix}_{run_index}")
+}
+
+async fn create_source_tables(pool: &PgPool, run_index: i64) -> anyhow::Result<()> {
+    for is_old in [true, false] {
+        let table = source_table_name(is_old, run_index);
+        let index = format!("{table}_composite_key_idx");
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, comparison_id UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE, run_index BIGINT NOT NULL CHECK (run_index = {run_index}), composite_primary_key TEXT NOT NULL, row_hash CHAR(64) NOT NULL, data JSONB NOT NULL)"
+        ))
+        .execute(pool)
+        .await?;
+        sqlx::query(&format!(
+            "CREATE UNIQUE INDEX {index} ON {table} (composite_primary_key)"
+        ))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn stream_load(
     pool: &PgPool,
     mut file: axum::extract::multipart::Field<'_>,
     table: &str,
     comparison_id: Uuid,
+    run_index: i64,
     fields: &[LayoutField],
 ) -> anyhow::Result<u64> {
     let mut pending = Vec::new();
-    let copy_statement = match table {
-        "old_rows" => {
-            "COPY old_rows (comparison_id, composite_primary_key, data) FROM STDIN WITH (FORMAT text)"
-        }
-        "new_rows" => {
-            "COPY new_rows (comparison_id, composite_primary_key, data) FROM STDIN WITH (FORMAT text)"
-        }
-        _ => anyhow::bail!("invalid source table"),
-    };
-    let mut copy = pool.copy_in_raw(copy_statement).await?;
-    let mut copy_buffer = Vec::with_capacity(COPY_BUFFER_SIZE);
+    let mut batch = Vec::with_capacity(INSERT_BATCH_SIZE);
     let mut count = 0;
     while let Some(chunk) = file.chunk().await? {
         pending.extend_from_slice(&chunk);
@@ -323,30 +382,32 @@ async fn stream_load(
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            if let Some((key, data)) = parse_row(&line, fields)? {
-                write_copy_row(&mut copy_buffer, comparison_id, &key, &data)?;
+            if let Some((key, row_hash, data)) = parse_row(&line, fields)? {
+                batch.push((key, row_hash, data));
                 count += 1;
             }
-            if copy_buffer.len() >= COPY_BUFFER_SIZE {
-                copy.send(copy_buffer.as_slice()).await?;
-                copy_buffer.clear();
+            if batch.len() == INSERT_BATCH_SIZE {
+                insert_batch(pool, table, comparison_id, run_index, &batch).await?;
+                batch.clear();
             }
         }
     }
     if !pending.is_empty() {
-        if let Some((key, data)) = parse_row(&pending, fields)? {
-            write_copy_row(&mut copy_buffer, comparison_id, &key, &data)?;
+        if let Some((key, row_hash, data)) = parse_row(&pending, fields)? {
+            batch.push((key, row_hash, data));
             count += 1;
         }
     }
-    if !copy_buffer.is_empty() {
-        copy.send(copy_buffer.as_slice()).await?;
+    if !batch.is_empty() {
+        insert_batch(pool, table, comparison_id, run_index, &batch).await?;
     }
-    copy.finish().await?;
     Ok(count)
 }
 
-fn parse_row(line: &[u8], fields: &[LayoutField]) -> anyhow::Result<Option<(String, Value)>> {
+fn parse_row(
+    line: &[u8],
+    fields: &[LayoutField],
+) -> anyhow::Result<Option<(String, String, Value)>> {
     if line.is_empty() {
         return Ok(None);
     }
@@ -371,43 +432,39 @@ fn parse_row(line: &[u8], fields: &[LayoutField]) -> anyhow::Result<Option<(Stri
         }
         data.insert(field.name.clone(), Value::String(value));
     }
-    Ok(Some((key_parts.join("\u{1f}"), Value::Object(data))))
+    let data = Value::Object(data);
+    let canonical_json = serde_json::to_vec(&data)?;
+    let row_hash = format!("{:x}", Sha256::digest(canonical_json));
+    Ok(Some((key_parts.join("\u{1f}"), row_hash, data)))
 }
 
-fn write_copy_row(
-    buffer: &mut Vec<u8>,
+async fn insert_batch(
+    pool: &PgPool,
+    table: &str,
     comparison_id: Uuid,
-    key: &str,
-    data: &Value,
+    run_index: i64,
+    rows: &[(String, String, Value)],
 ) -> anyhow::Result<()> {
-    copy_text_field(buffer, &comparison_id.to_string());
-    buffer.push(b'\t');
-    copy_text_field(buffer, key);
-    buffer.push(b'\t');
-    copy_text_field(buffer, &serde_json::to_string(data)?);
-    buffer.push(b'\n');
+    let mut builder = QueryBuilder::<Postgres>::new(format!(
+        "INSERT INTO {table} (comparison_id, run_index, composite_primary_key, row_hash, data) "
+    ));
+    builder.push_values(rows, |mut row, (key, row_hash, data)| {
+        row.push_bind(comparison_id)
+            .push_bind(run_index)
+            .push_bind(key)
+            .push_bind(row_hash)
+            .push_bind(sqlx::types::Json(data));
+    });
+    builder.build().execute(pool).await?;
     Ok(())
 }
 
-/// Escape a PostgreSQL COPY text field. The parser has already bounded memory
-/// to a line and `copy_buffer` is flushed regularly, so source size does not
-/// determine resident memory.
-fn copy_text_field(buffer: &mut Vec<u8>, value: &str) {
-    for byte in value.bytes() {
-        match byte {
-            b'\\' => buffer.extend_from_slice(b"\\\\"),
-            b'\t' => buffer.extend_from_slice(b"\\t"),
-            b'\n' => buffer.extend_from_slice(b"\\n"),
-            b'\r' => buffer.extend_from_slice(b"\\r"),
-            _ => buffer.push(byte),
-        }
-    }
-}
-
-async fn compute_delta(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, new_data, changed_fields) SELECT $1, o.composite_primary_key, 'modified', o.data, n.data, COALESCE(jsonb_object_agg(k, jsonb_build_object('old', o.data -> k, 'new', n.data -> k)) FILTER (WHERE (o.data -> k) IS DISTINCT FROM (n.data -> k)), '{}'::jsonb) FROM old_rows o JOIN new_rows n ON n.comparison_id = o.comparison_id AND n.composite_primary_key = o.composite_primary_key CROSS JOIN LATERAL jsonb_object_keys(o.data || n.data) AS k WHERE o.comparison_id = $1 AND o.data IS DISTINCT FROM n.data GROUP BY o.composite_primary_key, o.data, n.data").bind(id).execute(pool).await?;
-    sqlx::query("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, changed_fields) SELECT $1, o.composite_primary_key, 'removed', o.data, '{}'::jsonb FROM old_rows o LEFT JOIN new_rows n ON n.comparison_id = o.comparison_id AND n.composite_primary_key = o.composite_primary_key WHERE o.comparison_id = $1 AND n.id IS NULL").bind(id).execute(pool).await?;
-    sqlx::query("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, new_data, changed_fields) SELECT $1, n.composite_primary_key, 'added', n.data, '{}'::jsonb FROM new_rows n LEFT JOIN old_rows o ON o.comparison_id = n.comparison_id AND o.composite_primary_key = n.composite_primary_key WHERE n.comparison_id = $1 AND o.id IS NULL").bind(id).execute(pool).await?;
+async fn compute_delta(pool: &PgPool, id: Uuid, run_index: i64) -> anyhow::Result<()> {
+    let old_table = source_table_name(true, run_index);
+    let new_table = source_table_name(false, run_index);
+    sqlx::query(&format!("WITH changed AS MATERIALIZED (SELECT o.composite_primary_key, o.data AS old_data, n.data AS new_data FROM {old_table} o JOIN {new_table} n ON n.composite_primary_key = o.composite_primary_key WHERE o.comparison_id = $1 AND o.row_hash <> n.row_hash AND o.data IS DISTINCT FROM n.data) INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, new_data, changed_fields) SELECT $1, changed.composite_primary_key, 'modified', changed.old_data, changed.new_data, COALESCE(jsonb_object_agg(k, jsonb_build_object('old', changed.old_data -> k, 'new', changed.new_data -> k)) FILTER (WHERE (changed.old_data -> k) IS DISTINCT FROM (changed.new_data -> k)), '{{}}'::jsonb) FROM changed CROSS JOIN LATERAL jsonb_object_keys(changed.old_data || changed.new_data) AS k GROUP BY changed.composite_primary_key, changed.old_data, changed.new_data")).bind(id).execute(pool).await?;
+    sqlx::query(&format!("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, changed_fields) SELECT $1, o.composite_primary_key, 'removed', o.data, '{{}}'::jsonb FROM {old_table} o LEFT JOIN {new_table} n ON n.composite_primary_key = o.composite_primary_key WHERE o.comparison_id = $1 AND n.id IS NULL")).bind(id).execute(pool).await?;
+    sqlx::query(&format!("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, new_data, changed_fields) SELECT $1, n.composite_primary_key, 'added', n.data, '{{}}'::jsonb FROM {new_table} n LEFT JOIN {old_table} o ON o.composite_primary_key = n.composite_primary_key WHERE n.comparison_id = $1 AND o.id IS NULL")).bind(id).execute(pool).await?;
     Ok(())
 }
 
@@ -460,14 +517,21 @@ mod tests {
         ];
         let row = parse_row(b"01ALICE123", &fields).unwrap().unwrap();
         assert_eq!(row.0, "01\u{1f}123");
-        assert_eq!(row.1["name"], "ALICE");
+        assert_eq!(row.2["name"], "ALICE");
+        assert_eq!(row.1.len(), 64);
     }
 
     #[test]
-    fn copy_text_escapes_copy_control_characters() {
-        let mut encoded = Vec::new();
-        copy_text_field(&mut encoded, "a\tb\nc\\d");
-        assert_eq!(encoded, b"a\\tb\\nc\\\\d");
+    fn row_fingerprint_is_stable_for_identical_parsed_data() {
+        let fields = vec![LayoutField {
+            name: "account".into(),
+            start: 1,
+            end: 3,
+            is_primary_key: true,
+        }];
+        let first = parse_row(b"123", &fields).unwrap().unwrap();
+        let second = parse_row(b"123", &fields).unwrap().unwrap();
+        assert_eq!(first.1, second.1);
     }
 
     #[test]
