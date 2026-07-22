@@ -1,11 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/recon-core",
-    "crates/recon-schema",
     "crates/recon-web",
-    "crates/recon-report",
-    "crates/recon-orch",
 ]
 
 [workspace.package]
@@ -15,29 +11,22 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Internal crates
-recon-core = { path = "crates/recon-core" }
-recon-schema = { path = "crates/recon-schema" }
-recon-report = { path = "crates/recon-report" }
-recon-orch = { path = "crates/recon-orch" }
-
 # Serde / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_norway = "0.9"
 
 # Errors
 anyhow = "1"
 thiserror = "2"
 
-# CLI
-clap = { version = "4", features = ["derive"] }
-
 # Web
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
-maud = "0.27"
 rust-embed = { version = "8", features = ["mime-guess"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "migrate"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # DataFrame engine. `new_streaming` (polars-stream) is REQUIRED: sinks only run
 # with bounded memory on the streaming engine, and the 1M–100M rows/source
@@ -62,7 +51,7 @@ jiff = { version = "0.2", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Async runtime (web + orch)
+# Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "process"] }
 
 # Dev/test
