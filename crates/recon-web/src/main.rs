@@ -18,12 +18,17 @@ use sqlx::{
     FromRow, PgPool, Postgres, QueryBuilder,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
 const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
-const INSERT_BATCH_SIZE: usize = 10_000;
+const INSERT_BATCH_SIZE: usize = 5_000;
+const PARSE_WORK_QUEUE_CAPACITY: usize = 2_048;
+const PARSE_RESULT_QUEUE_CAPACITY: usize = 2_048;
+
+type ParsedRow = (String, String, Value);
 
 #[derive(Clone)]
 struct AppState {
@@ -369,45 +374,127 @@ async fn stream_load(
     run_index: i64,
     fields: &[LayoutField],
 ) -> anyhow::Result<u64> {
+    let worker_count = parsing_worker_count();
+    let per_worker_queue_capacity = (PARSE_WORK_QUEUE_CAPACITY / worker_count).max(1);
+    let (row_sender, mut row_receiver) = mpsc::channel(PARSE_RESULT_QUEUE_CAPACITY);
+    let mut line_senders = Vec::with_capacity(worker_count);
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let (line_sender, mut line_receiver) = mpsc::channel::<Vec<u8>>(per_worker_queue_capacity);
+        line_senders.push(line_sender);
+        let row_sender = row_sender.clone();
+        let fields = fields.to_vec();
+        workers.push(tokio::task::spawn_blocking(move || {
+            loop {
+                let line = line_receiver.blocking_recv();
+                let Some(line) = line else {
+                    break;
+                };
+                if row_sender.blocking_send(parse_row(&line, &fields)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(row_sender);
+
+    let writer_pool = pool.clone();
+    let writer_table = table.to_owned();
+    let writer = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(INSERT_BATCH_SIZE);
+        let mut count = 0;
+        let mut parse_error = None;
+        while let Some(parsed) = row_receiver.recv().await {
+            match parsed {
+                Ok(Some(row)) if parse_error.is_none() => {
+                    batch.push(row);
+                    count += 1;
+                    if batch.len() == INSERT_BATCH_SIZE {
+                        insert_batch(
+                            &writer_pool,
+                            &writer_table,
+                            comparison_id,
+                            run_index,
+                            &batch,
+                        )
+                        .await?;
+                        batch.clear();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Drain the pipeline before returning so bounded channels
+                    // cannot leave workers or the multipart reader blocked.
+                    parse_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = parse_error {
+            return Err(error);
+        }
+        if !batch.is_empty() {
+            insert_batch(
+                &writer_pool,
+                &writer_table,
+                comparison_id,
+                run_index,
+                &batch,
+            )
+            .await?;
+        }
+        Ok::<u64, anyhow::Error>(count)
+    });
+
     let mut pending = Vec::new();
-    let mut batch = Vec::with_capacity(INSERT_BATCH_SIZE);
-    let mut count = 0;
-    while let Some(chunk) = file.chunk().await? {
-        pending.extend_from_slice(&chunk);
-        while let Some(newline) = pending.iter().position(|b| *b == b'\n') {
-            let mut line: Vec<u8> = pending.drain(..=newline).collect();
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            if let Some((key, row_hash, data)) = parse_row(&line, fields)? {
-                batch.push((key, row_hash, data));
-                count += 1;
-            }
-            if batch.len() == INSERT_BATCH_SIZE {
-                insert_batch(pool, table, comparison_id, run_index, &batch).await?;
-                batch.clear();
+    let mut next_worker = 0;
+    let read_result = async {
+        while let Some(chunk) = file.chunk().await? {
+            pending.extend_from_slice(&chunk);
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = pending.drain(..=newline).collect();
+                line.pop(); // newline found above
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                line_senders[next_worker]
+                    .send(line)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("parsing workers stopped unexpectedly"))?;
+                next_worker = (next_worker + 1) % worker_count;
             }
         }
-    }
-    if !pending.is_empty() {
-        if let Some((key, row_hash, data)) = parse_row(&pending, fields)? {
-            batch.push((key, row_hash, data));
-            count += 1;
+        if !pending.is_empty() {
+            line_senders[next_worker]
+                .send(pending)
+                .await
+                .map_err(|_| anyhow::anyhow!("parsing workers stopped unexpectedly"))?;
         }
+        Ok::<(), anyhow::Error>(())
     }
-    if !batch.is_empty() {
-        insert_batch(pool, table, comparison_id, run_index, &batch).await?;
+    .await;
+    drop(line_senders);
+
+    for worker in workers {
+        worker.await.context("parsing worker panicked")?;
     }
-    Ok(count)
+    let write_result = writer.await.context("database writer task panicked")?;
+    read_result?;
+    write_result
 }
 
-fn parse_row(
-    line: &[u8],
-    fields: &[LayoutField],
-) -> anyhow::Result<Option<(String, String, Value)>> {
+fn parsing_worker_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    parsing_worker_count_for(available)
+}
+
+fn parsing_worker_count_for(available: usize) -> usize {
+    (available.saturating_mul(7) / 10).max(1)
+}
+
+fn parse_row(line: &[u8], fields: &[LayoutField]) -> anyhow::Result<Option<ParsedRow>> {
     if line.is_empty() {
         return Ok(None);
     }
@@ -533,6 +620,13 @@ mod tests {
         let first = parse_row(b"123", &fields).unwrap().unwrap();
         let second = parse_row(b"123", &fields).unwrap().unwrap();
         assert_eq!(first.1, second.1);
+    }
+
+    #[test]
+    fn parsing_workers_are_capped_at_seventy_percent_of_available_threads() {
+        assert_eq!(parsing_worker_count_for(10), 7);
+        assert_eq!(parsing_worker_count_for(4), 2);
+        assert_eq!(parsing_worker_count_for(1), 1);
     }
 
     #[test]
