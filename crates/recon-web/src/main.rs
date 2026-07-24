@@ -14,13 +14,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::{
     FromRow, PgPool, Postgres, QueryBuilder,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+use xxhash_rust::xxh3::xxh3_64;
 
 const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 const INSERT_BATCH_SIZE: usize = 1_000;
@@ -348,7 +348,7 @@ async fn create_source_tables(pool: &PgPool, run_index: i64) -> anyhow::Result<(
         let table = source_table_name(is_old, run_index);
         let index = format!("{table}_composite_key_idx");
         sqlx::query(&format!(
-            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, comparison_id UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE, run_index BIGINT NOT NULL CHECK (run_index = {run_index}), composite_primary_key TEXT NOT NULL, row_hash CHAR(64) NOT NULL, data JSONB NOT NULL)"
+            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, comparison_id UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE, run_index BIGINT NOT NULL CHECK (run_index = {run_index}), composite_primary_key CHAR(16) NOT NULL, row_hash CHAR(16) NOT NULL, data JSONB NOT NULL)"
         ))
         .execute(pool)
         .await?;
@@ -432,10 +432,14 @@ fn parse_row(
         }
         data.insert(field.name.clone(), Value::String(value));
     }
+    // Delimit the ordered key fields before hashing so composite keys cannot
+    // collapse into the same input merely because their field boundaries differ.
+    let composite_key = key_parts.join("\u{1f}");
+    let composite_primary_key = format!("{:016x}", xxh3_64(composite_key.as_bytes()));
     let data = Value::Object(data);
     let canonical_json = serde_json::to_vec(&data)?;
-    let row_hash = format!("{:x}", Sha256::digest(canonical_json));
-    Ok(Some((key_parts.join("\u{1f}"), row_hash, data)))
+    let row_hash = format!("{:016x}", xxh3_64(&canonical_json));
+    Ok(Some((composite_primary_key, row_hash, data)))
 }
 
 async fn insert_batch(
@@ -494,7 +498,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn composite_key_uses_key_fields_in_layout_order() {
+    fn composite_key_is_xxhash_of_key_fields_in_layout_order() {
         let fields = vec![
             LayoutField {
                 name: "branch".into(),
@@ -516,9 +520,10 @@ mod tests {
             },
         ];
         let row = parse_row(b"01ALICE123", &fields).unwrap().unwrap();
-        assert_eq!(row.0, "01\u{1f}123");
+        assert_eq!(row.0, format!("{:016x}", xxh3_64(b"01\x1f123")));
+        assert_eq!(row.0.len(), 16);
         assert_eq!(row.2["name"], "ALICE");
-        assert_eq!(row.1.len(), 64);
+        assert_eq!(row.1.len(), 16);
     }
 
     #[test]
