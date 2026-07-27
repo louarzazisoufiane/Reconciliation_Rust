@@ -92,7 +92,7 @@ For each matched row:
 
 4. **For each matched pair:**
    - Create a new comparison run in `comparison_runs` (reusing the existing `create_comparison` logic).
-   - The run name is: `scheduled_{scheduled_id}_{common_chunks_concatenated}`, where common_chunks_concatenated is the longest common substring (not the sum) between the two filenames, with non-alphanumeric characters stripped or replaced by underscores. Alternatively, just use the longest common substring directly. Keep it short enough to be readable.
+   - The run name is: `scheduled_{scheduled_id}_{common_chunks_concatenated}`, where common_chunks_concatenated is **all** common substrings (between the two filenames) concatenated together in order of appearance (no overlap). Non-alphanumeric characters stripped or replaced by underscores. Truncate if too long (max 100 chars).
    - Use the `old_layout_id` and `new_layout_id` from the scheduled row.
    - Read the file contents from disk (instead of multipart upload) and feed them through the existing parse + load pipeline.
    - Record the mapping in `scheduled_runs`.

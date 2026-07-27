@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api, ApiRequestError } from "./api";
-import type { ComparisonRun, DeltaRow, Layout, LayoutField } from "./types";
+import type { ComparisonRun, DeltaRow, Layout, LayoutField, NewScheduledTask, ScheduledTask, ScheduleFrequency } from "./types";
 
 const blank = (): LayoutField => ({ name: "", start: 1, end: 1, is_primary_key: false });
 const currentLocalTimestamp = () => new Date().toISOString().slice(0, 19);
@@ -34,9 +35,11 @@ function inferFieldsFromHeader(header: string): LayoutField[] {
   addField(line.length);
   return fields;
 }
-type Page = "compare" | "history" | "detail";
+type Page = "compare" | "history" | "detail" | "scheduled";
 
 export default function App() {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [layouts, setLayouts] = useState<Layout[]>([]);
   const [fields, setFields] = useState<LayoutField[]>([blank(), blank(), blank()]);
   const [layoutName, setLayoutName] = useState("");
@@ -65,10 +68,13 @@ export default function App() {
   useEffect(() => { refreshLayouts(); }, []);
 
   async function showHistory() {
-    setError(null); setMessage(null); setPage("history");
+    setError(null); setMessage(null); setPage("history"); navigate("/history");
     try { setHistory(await api.listComparisons()); }
     catch (e) { setError(e instanceof Error ? e.message : "Could not load run history"); }
   }
+  function showScheduled() { setError(null); setMessage(null); setPage("scheduled"); navigate("/scheduled"); }
+  function showComparison() { setError(null); setMessage(null); setPage("compare"); navigate("/"); }
+  useEffect(() => { if (location.pathname === "/scheduled") setPage("scheduled"); else if (location.pathname === "/history") setPage("history"); else if (location.pathname === "/") setPage("compare"); }, [location.pathname]);
   async function openRun(run: ComparisonRun) {
     setError(null); setSelectedRun(run); setSelectedDelta([]); setPage("detail");
     try { setSelectedDelta(await api.getDelta(run.id)); }
@@ -103,7 +109,7 @@ export default function App() {
   }
 
   return <div className="min-h-screen">
-    <nav className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--head)]/85 backdrop-blur-md"><div className="mx-auto flex max-w-5xl items-center gap-4 px-6 py-3 font-semibold"><span className="grid h-7 w-7 place-items-center rounded-lg bg-[var(--accent)] text-white">⇄</span><span className="mr-auto font-display text-lg">Fixed-width Reconcile</span><button className={navClass(page === "compare")} onClick={() => setPage("compare")}>New comparison</button><button className={navClass(page !== "compare")} onClick={showHistory}>History</button></div></nav>
+    <nav className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--head)]/85 backdrop-blur-md"><div className="mx-auto flex max-w-5xl items-center gap-4 px-6 py-3 font-semibold"><span className="grid h-7 w-7 place-items-center rounded-lg bg-[var(--accent)] text-white">⇄</span><span className="mr-auto font-display text-lg">Fixed-width Reconcile</span><button className={navClass(page === "compare")} onClick={showComparison}>New comparison</button><button className={navClass(page === "scheduled")} onClick={showScheduled}>Scheduled</button><button className={navClass(page === "history" || page === "detail")} onClick={showHistory}>History</button></div></nav>
     <main className="mx-auto max-w-5xl px-6 py-8">
       {error && <p className="mb-4 rounded-lg bg-[var(--fail-soft)] p-3 text-[var(--fail)]">{error}</p>}
       {message && <p className="mb-4 rounded-lg bg-[var(--pass-soft)] p-3 text-[var(--pass)]">{message}</p>}
@@ -124,9 +130,33 @@ export default function App() {
       </>}
       {page === "history" && <History runs={history} onOpen={openRun}/>}
       {page === "detail" && selectedRun && <><button className="mb-5 rounded-lg border border-[var(--border)] px-3 py-2" onClick={showHistory}>← Back to history</button><RunSummary run={selectedRun}/><DeltaTable title="Stored differences" delta={selectedDelta}/></>}
+      {page === "scheduled" && <ScheduledPage layouts={layouts} onError={setError} onMessage={setMessage}/>}
     </main>
   </div>;
 }
+
+const blankSchedule = (): NewScheduledTask => ({ name: "", frequency: "one_time", run_at: currentLocalTimestamp(), old_path: "", new_path: "", archive_path: "", old_layout_id: "", new_layout_id: "" });
+function frequencyLabel(value: ScheduleFrequency) { return ({ one_time: "One Time", daily: "Daily", weekly: "Weekly", monthly: "Monthly" })[value]; }
+function ScheduleForm({ layouts, value, submitLabel, onSubmit, onCancel }: { layouts: Layout[]; value: NewScheduledTask; submitLabel: string; onSubmit: (value: NewScheduledTask) => Promise<void>; onCancel?: () => void }) {
+  const [draft, setDraft] = useState(value); const [saving, setSaving] = useState(false);
+  useEffect(() => setDraft(value), [value]);
+  useEffect(() => setDraft((old) => ({ ...old, old_layout_id: old.old_layout_id || layouts[0]?.id || "", new_layout_id: old.new_layout_id || layouts[0]?.id || "" })), [layouts]);
+  const set = <K extends keyof NewScheduledTask>(key: K, next: NewScheduledTask[K]) => setDraft((old) => ({ ...old, [key]: next }));
+  async function submit(event: FormEvent) { event.preventDefault(); setSaving(true); try { await onSubmit({ ...draft, run_at: toUtcTimestamp(draft.run_at) }); } finally { setSaving(false); } }
+  return <form onSubmit={submit} className="grid gap-3 md:grid-cols-2"><label className="block text-sm font-medium md:col-span-2">Name<input required className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.name} onChange={(e) => set("name", e.target.value)} placeholder="e.g. nightly customer files"/></label><label className="block text-sm font-medium">Frequency<select className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.frequency} onChange={(e) => set("frequency", e.target.value as ScheduleFrequency)}>{(["one_time", "daily", "weekly", "monthly"] as ScheduleFrequency[]).map((item) => <option key={item} value={item}>{frequencyLabel(item)}</option>)}</select></label><label className="block text-sm font-medium">First run at<input required type="datetime-local" step="1" className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.run_at} onChange={(e) => set("run_at", e.target.value)}/></label><label className="block text-sm font-medium">Old path<input required className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.old_path} onChange={(e) => set("old_path", e.target.value)} placeholder="/srv/reconciliation/old"/></label><label className="block text-sm font-medium">New path<input required className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.new_path} onChange={(e) => set("new_path", e.target.value)} placeholder="/srv/reconciliation/new"/></label><label className="block text-sm font-medium md:col-span-2">Archive path<input required className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.archive_path} onChange={(e) => set("archive_path", e.target.value)} placeholder="/srv/reconciliation/archive"/></label><label className="block text-sm font-medium">Old layout<select required className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.old_layout_id} onChange={(e) => set("old_layout_id", e.target.value)}><option value="">Choose layout…</option>{layouts.map((layout) => <option key={layout.id} value={layout.id}>{layout.name}</option>)}</select></label><label className="block text-sm font-medium">New layout<select required className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" value={draft.new_layout_id} onChange={(e) => set("new_layout_id", e.target.value)}><option value="">Choose layout…</option>{layouts.map((layout) => <option key={layout.id} value={layout.id}>{layout.name}</option>)}</select></label><div className="flex gap-3 md:col-span-2"><button disabled={saving} className="rounded-lg bg-[var(--accent)] px-4 py-2 font-semibold text-white disabled:opacity-60">{saving ? "Saving…" : submitLabel}</button>{onCancel && <button type="button" className="rounded-lg border border-[var(--border)] px-4 py-2" onClick={onCancel}>Cancel edit</button>}</div></form>;
+}
+function ScheduledPage({ layouts, onError, onMessage }: { layouts: Layout[]; onError: (value: string | null) => void; onMessage: (value: string | null) => void }) {
+  const [tasks, setTasks] = useState<ScheduledTask[]>([]); const [draft, setDraft] = useState(blankSchedule); const [editing, setEditing] = useState<ScheduledTask | null>(null); const [all, setAll] = useState(false); const [loading, setLoading] = useState(true);
+  async function refresh() { setLoading(true); try { setTasks(await api.listScheduled(all ? "all" : "pending")); } catch (e) { onError(e instanceof Error ? e.message : "Could not load schedules"); } finally { setLoading(false); } }
+  useEffect(() => { refresh(); }, [all]);
+  async function create(value: NewScheduledTask) { onError(null); try { await api.createScheduled(value); setDraft(blankSchedule()); onMessage("Scheduled task created."); await refresh(); } catch (e) { onError(e instanceof Error ? e.message : "Could not create schedule"); } }
+  async function update(value: NewScheduledTask) { if (!editing) return; onError(null); try { await api.updateScheduled(editing.id, value); setEditing(null); onMessage("Scheduled task updated."); await refresh(); } catch (e) { onError(e instanceof Error ? e.message : "Could not update schedule"); } }
+  async function remove(task: ScheduledTask) { if (!window.confirm(`Delete scheduled task “${task.name}”?`)) return; try { await api.deleteScheduled(task.id); onMessage("Scheduled task deleted."); await refresh(); } catch (e) { onError(e instanceof Error ? e.message : "Could not delete schedule"); } }
+  async function runNow(task: ScheduledTask) { try { await api.runScheduledNow(task.id); onMessage(`“${task.name}” is running.`); await refresh(); } catch (e) { onError(e instanceof Error ? e.message : "Could not start schedule"); } }
+  const editValue = editing && { name: editing.name, frequency: editing.frequency, run_at: new Date(editing.run_at).toISOString().slice(0, 19), old_path: editing.old_path, new_path: editing.new_path, archive_path: editing.archive_path, old_layout_id: editing.old_layout_id, new_layout_id: editing.new_layout_id };
+  return <><header className="mb-7"><h1 className="font-display text-3xl font-semibold">Scheduled comparisons</h1><p className="mt-1 text-[var(--muted)]">Run directory-based comparisons once or on a recurring cadence.</p></header><section className="mb-8 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[var(--shadow-sm)]"><h2 className="mb-4 font-display text-xl font-semibold">{editing ? "Edit scheduled task" : "Create scheduled task"}</h2><ScheduleForm layouts={layouts} value={editValue ?? draft} submitLabel={editing ? "Save schedule" : "Create schedule"} onSubmit={editing ? update : create} onCancel={editing ? () => setEditing(null) : undefined}/></section><section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-sm)]"><div className="flex items-center justify-between gap-3 p-5"><div><h2 className="font-display text-xl font-semibold">Pending schedules</h2><p className="text-sm text-[var(--muted)]">Tasks waiting to run or needing attention.</p></div><label className="text-sm"><input className="mr-2" type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)}/>Show completed</label></div>{loading ? <p className="border-t border-[var(--border)] p-5 text-[var(--muted)]">Loading schedules…</p> : tasks.length === 0 ? <p className="border-t border-[var(--border)] p-5 text-[var(--muted)]">No scheduled tasks to show.</p> : <div className="overflow-auto border-t border-[var(--border)]"><table className="w-full text-left text-sm"><thead className="bg-[var(--surface-2)] text-[var(--muted)]"><tr><th className="p-3">Name</th><th className="p-3">Frequency</th><th className="p-3">Next Run At</th><th className="p-3">Status</th><th className="p-3">Last Run At</th><th className="p-3">Actions</th></tr></thead><tbody>{tasks.map((task) => <tr className="border-t border-[var(--border)]" key={task.id}><td className="p-3 font-medium">{task.name}{task.error_message && <div className="mt-1 max-w-xs text-xs text-[var(--fail)]">{task.error_message}</div>}</td><td className="p-3">{frequencyLabel(task.frequency)}</td><td className="p-3 whitespace-nowrap">{formatTime(task.run_at)}</td><td className="p-3"><StatusBadge status={task.status}/></td><td className="p-3 whitespace-nowrap">{formatTime(task.last_run_at)}</td><td className="p-3 whitespace-nowrap"><button className="mr-2 rounded border border-[var(--border)] px-2 py-1" onClick={() => setEditing(task)}>Edit</button><button className="mr-2 rounded border border-[var(--border)] px-2 py-1 text-[var(--fail)]" onClick={() => remove(task)}>Delete</button><button disabled={task.status === "running" || task.status === "completed"} className="rounded bg-[var(--accent)] px-2 py-1 text-white disabled:opacity-50" onClick={() => runNow(task)}>Run now</button></td></tr>)}</tbody></table></div>}</section></>;
+}
+function StatusBadge({ status }: { status: ScheduledTask["status"] }) { const style = status === "failed" ? "bg-[var(--fail-soft)] text-[var(--fail)]" : status === "completed" ? "bg-[var(--pass-soft)] text-[var(--pass)]" : status === "running" ? "bg-[var(--accent-soft)] text-[var(--accent)]" : "bg-[var(--surface-2)] text-[var(--muted)]"; return <span className={`rounded-full px-2 py-1 text-xs font-semibold capitalize ${style}`}>{status}</span>; }
 
 function navClass(active: boolean) { return `rounded-lg px-3 py-1.5 text-sm ${active ? "bg-[var(--accent)] text-white" : "text-[var(--muted)]"}`; }
 function formatTime(value: string | null) { return value ? new Date(value).toLocaleString() : "—"; }
