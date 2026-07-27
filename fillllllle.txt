@@ -1,0 +1,139 @@
+## New Feature: Scheduled Comparisons
+
+Add a new "Scheduled" page alongside the existing "History" and "New Comparison" pages. The page uses a **top/bottom split layout**: the top half is a form to create a new scheduled task, and the bottom half is a table listing pending/not-yet-executed scheduled tasks.
+
+---
+
+### 1. Database Table: `scheduled`
+
+Add a new table (via migration):
+
+```sql
+CREATE TABLE scheduled (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    frequency       TEXT NOT NULL CHECK (frequency IN ('one_time', 'daily', 'weekly', 'monthly')),
+    run_at          TIMESTAMPTZ NOT NULL,          -- next execution time
+    old_path        TEXT NOT NULL,                  -- directory path containing old files
+    new_path        TEXT NOT NULL,                  -- directory path containing new files
+    old_layout_id   UUID NOT NULL REFERENCES layouts(id),
+    new_layout_id   UUID NOT NULL REFERENCES layouts(id),
+    archive_path    TEXT NOT NULL,                  -- base directory for archiving processed files
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_run_at     TIMESTAMPTZ,                    -- last execution timestamp
+    error_message   TEXT                            -- stores failure reason if any
+);
+```
+
+Also add a child table to track which file pairs have already been reconciled per schedule (prevents re-processing in recurring runs):
+
+```sql
+CREATE TABLE scheduled_runs (
+    id              BIGSERIAL PRIMARY KEY,
+    scheduled_id    UUID NOT NULL REFERENCES scheduled(id) ON DELETE CASCADE,
+    comparison_id   UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE,
+    old_filename    TEXT NOT NULL,
+    new_filename    TEXT NOT NULL,
+    processed_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+---
+
+### 2. Create Scheduled Form (Top Half)
+
+Inputs:
+- **Name** — user-defined label (text input)
+- **Frequency** — radio/select: `One Time`, `Daily`, `Weekly`, `Monthly`
+- **Run At** — datetime picker. For `One Time` this is the exact execution datetime. For recurring frequencies this is the *first* execution datetime; the `run_at` is then advanced automatically after each run (daily = +1 day, weekly = +7 days, monthly = +1 month).
+- **Old Path** — text input for the server directory path containing old mainframe files
+- **New Path** — text input for the server directory path containing new files
+- **Archive Path** — text input for the base directory where processed files are moved after reconciliation
+- **Old Layout** — dropdown selecting from the existing `layouts` table
+- **New Layout** — dropdown selecting from the existing `layouts` table
+
+Validation: The server checks that `old_path` and `new_path` exist and are readable when creating the schedule.
+
+---
+
+### 3. Pending Schedules Table (Bottom Half)
+
+Columns displayed:
+- Name
+- Frequency (human-readable: "One Time", "Daily", "Weekly", "Monthly")
+- Next Run At
+- Status (with colored badges: Pending/Running/Completed/Failed)
+- Last Run At
+- Actions column: [Edit] [Delete] [Run Now]
+
+Only rows with `status = 'pending'` OR `status = 'failed'` are shown (not completed ones, unless there's a filter toggle).
+
+---
+
+### 4. Background Scheduler Worker
+
+A tokio background task polls the `scheduled` table every 60 seconds for rows where:
+- `status = 'pending'`
+- `run_at <= now()`
+
+For each matched row:
+
+1. **Atomically update** `status = 'running'` to prevent duplicate processing.
+
+2. **Scan directories** — list all files in `old_path` and `new_path`. Filter to relevant file extensions (e.g. `.txt`, `.dat`, or no filter).
+
+3. **Match files by maximum name resemblance:**
+   - For each pair of files (one from old_path, one from new_path), compute a resemblance score = sum of lengths of all common substrings between the two filenames.
+   - Example: `"ABC_DEF_001.dat"` vs `"ABC_DEF_002.dat"` → common substrings: "ABC_DEF_00" (length 9) + ".dat" (length 4) → score = 13.
+   - Use a greedy matching: find the pair with the highest score, assign them, remove both from the pool, repeat until one directory is exhausted.
+   - The best-matching filename pair is the one with the highest sum-of-common-substrings score.
+   - If a file in one path has zero resemblance to any file in the other path, skip it (log a warning).
+
+4. **For each matched pair:**
+   - Create a new comparison run in `comparison_runs` (reusing the existing `create_comparison` logic).
+   - The run name is: `scheduled_{scheduled_id}_{common_chunks_concatenated}`, where common_chunks_concatenated is the longest common substring (not the sum) between the two filenames, with non-alphanumeric characters stripped or replaced by underscores. Alternatively, just use the longest common substring directly. Keep it short enough to be readable.
+   - Use the `old_layout_id` and `new_layout_id` from the scheduled row.
+   - Read the file contents from disk (instead of multipart upload) and feed them through the existing parse + load pipeline.
+   - Record the mapping in `scheduled_runs`.
+
+5. **After all pairs processed:**
+   - **Move origin files** to `{archive_path}/matching/old/` and `{archive_path}/matching/new/` respectively, preserving the directory structure. The source files are moved (not copied) so they are no longer in the original paths.
+   - For recurring schedules (`daily`/`weekly`/`monthly`): update `run_at` to the next occurrence (add 1 day / 7 days / 1 month), reset `status = 'pending'`, set `last_run_at = now()`.
+   - For `one_time`: set `status = 'completed'`, set `last_run_at = now()`.
+   - On failure at any step: set `status = 'failed'`, store the error message in `error_message`, and stop processing this schedule (do not advance `run_at`).
+
+---
+
+### 5. API Endpoints
+
+```
+GET    /api/scheduled                    → list all scheduled tasks (supports ?status=pending filter)
+POST   /api/scheduled                    → create a new scheduled task (body: CreateScheduledRequest)
+GET    /api/scheduled/{id}               → get a single scheduled task
+PUT    /api/scheduled/{id}               → update a scheduled task
+DELETE /api/scheduled/{id}               → delete a scheduled task
+POST   /api/scheduled/{id}/run-now       → immediately trigger execution (same logic as the background worker)
+```
+
+---
+
+### 6. Frontend
+
+- **New route:** `/scheduled` in React Router
+- **New nav item:** "Scheduled" in the sidebar/nav bar
+- **Top section:** the "Create Scheduled" form with all fields listed above
+- **Bottom section:** table of pending schedules with status badges and action buttons
+- **Edit modal or inline edit** for updating a schedule
+- **Confirmation dialog** for deletion
+- Loading states and error toasts matching the existing UI patterns
+
+---
+
+### 7. Constraints & Edge Cases
+
+- The background worker must use row-level locking (`SELECT ... FOR UPDATE SKIP LOCKED`) to handle multiple app instances safely.
+- File matching is done in memory — for very large directories (1000+ files), consider a progress indicator or handle in batches.
+- If a scheduled task is deleted mid-execution, the running reconciliation should be allowed to complete (orphan `scheduled_runs` rows are fine).
+- The move-to-archive step must be atomic per file pair (move old, move new, then record — if one move fails, log and continue).
+- The `archive_path` must be on the same filesystem as `old_path`/`new_path` to allow `rename` (atomic move). If cross-filesystem, fall back to copy + delete.
