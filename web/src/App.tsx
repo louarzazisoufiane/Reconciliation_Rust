@@ -5,12 +5,42 @@ import type { ComparisonRun, DeltaRow, Layout, LayoutField } from "./types";
 const blank = (): LayoutField => ({ name: "", start: 1, end: 1, is_primary_key: false });
 const currentLocalTimestamp = () => new Date().toISOString().slice(0, 19);
 const toUtcTimestamp = (localTimestamp: string) => new Date(localTimestamp).toISOString();
+
+function inferFieldsFromHeader(header: string): LayoutField[] {
+  const line = header.split(/\r?\n/, 1)[0] ?? "";
+  const fields: LayoutField[] = [];
+  let segmentStart = 0;
+
+  const addField = (segmentEnd: number, end?: number) => {
+    const segment = line.slice(segmentStart, segmentEnd);
+    const firstCharacter = segment.search(/\S/);
+    if (firstCharacter === -1) return;
+
+    const lastCharacter = segment.search(/\s*$/);
+    fields.push({
+      name: segment.slice(firstCharacter, lastCharacter),
+      start: segmentStart + firstCharacter + 1,
+      end: end ?? segmentStart + lastCharacter,
+      is_primary_key: false,
+    });
+  };
+
+  for (const separator of line.matchAll(/\s{1,}/g)) {
+    // Separator padding is part of the preceding fixed-width column, so its
+    // end reaches the character immediately before the next field starts.
+    addField(separator.index, separator.index + separator[0].length);
+    segmentStart = separator.index + separator[0].length;
+  }
+  addField(line.length);
+  return fields;
+}
 type Page = "compare" | "history" | "detail";
 
 export default function App() {
   const [layouts, setLayouts] = useState<Layout[]>([]);
   const [fields, setFields] = useState<LayoutField[]>([blank(), blank(), blank()]);
   const [layoutName, setLayoutName] = useState("");
+  const [headerLine, setHeaderLine] = useState("");
   const [oldLayout, setOldLayout] = useState("");
   const [newLayout, setNewLayout] = useState("");
   const [oldFile, setOldFile] = useState<File | null>(null);
@@ -50,7 +80,7 @@ export default function App() {
     try {
       const layout = await api.createLayout({ name: layoutName, fields: fields.filter((field) => field.name.trim()) });
       setLayouts((old) => [...old, layout].sort((a, b) => a.name.localeCompare(b.name))); setOldLayout(layout.id); setNewLayout(layout.id);
-      setLayoutName(""); setFields([blank(), blank(), blank()]); setMessage(`Saved layout “${layout.name}”.`);
+      setLayoutName(""); setHeaderLine(""); setFields([blank(), blank(), blank()]); setMessage(`Saved layout “${layout.name}”.`);
     } catch (e) { setError(e instanceof Error ? e.message : "Could not save layout"); }
   }
   async function compare(e: FormEvent) {
@@ -81,6 +111,7 @@ export default function App() {
         <header className="mb-7"><h1 className="font-display text-3xl font-semibold">Compare fixed-width files</h1><p className="mt-1 text-[var(--muted)]">Save reusable layouts, upload old and new files, then review their database-backed delta.</p></header>
         <section className="mb-8 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[var(--shadow-sm)]"><h2 className="font-display text-xl font-semibold">1. Create a layout</h2><p className="mb-4 text-sm text-[var(--muted)]">Positions are 1-based and inclusive. Select every field contributing to the composite primary key.</p>
           <form onSubmit={saveLayout}><input className="mb-3 w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2" required value={layoutName} onChange={(e) => setLayoutName(e.target.value)} placeholder="Layout name, e.g. customers-v1" />
+            <div className="mb-4"><label className="block text-sm font-medium">Header line<textarea className="mt-1 block w-full rounded-lg border border-[var(--border)] bg-white px-3 py-2 font-mono text-sm" rows={2} value={headerLine} onChange={(e) => setHeaderLine(e.target.value)} placeholder="Customer ID    Full Name          Account     Balance" /></label><div className="mt-2 flex items-center gap-3"><button type="button" className="rounded-lg border border-[var(--border)] px-3 py-2" onClick={() => setFields(inferFieldsFromHeader(headerLine))}>Infer</button><span className="text-sm text-[var(--muted)]">Two or more spaces separate columns; single spaces stay in field names.</span></div></div>
             <div className="grid grid-cols-[1fr_90px_90px_100px] gap-2 text-sm font-semibold text-[var(--muted)]"><span>Field name</span><span>Start</span><span>End</span><span>Primary key</span></div>
             {fields.map((field, i) => <div className="mt-2 grid grid-cols-[1fr_90px_90px_100px] gap-2" key={i}><input className="rounded-lg border border-[var(--border)] px-3 py-2" value={field.name} onChange={(e) => update(i, { name: e.target.value })} placeholder="customer_id"/><input className="rounded-lg border border-[var(--border)] px-3 py-2" type="number" min="1" value={field.start} onChange={(e) => update(i, { start: Number(e.target.value) })}/><input className="rounded-lg border border-[var(--border)] px-3 py-2" type="number" min="1" value={field.end} onChange={(e) => update(i, { end: Number(e.target.value) })}/><label className="flex items-center justify-center"><input type="checkbox" checked={field.is_primary_key} onChange={(e) => update(i, { is_primary_key: e.target.checked })}/></label></div>)}
             <div className="mt-4 flex gap-3"><button type="button" className="rounded-lg border border-[var(--border)] px-3 py-2" onClick={() => setFields((old) => [...old, blank()])}>+ Add field</button><button className="rounded-lg bg-[var(--accent)] px-3 py-2 font-semibold text-white">Save layout</button></div>

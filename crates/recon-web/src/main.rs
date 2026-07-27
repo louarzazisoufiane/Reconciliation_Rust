@@ -28,7 +28,9 @@ const INSERT_BATCH_SIZE: usize = 5_000;
 const PARSE_WORK_QUEUE_CAPACITY: usize = 2_048;
 const PARSE_RESULT_QUEUE_CAPACITY: usize = 2_048;
 
-type ParsedRow = (String, String, Value);
+// The JSON payload is serialized once while parsing. Its bytes are both the
+// row-hash input and the value bound to PostgreSQL as JSONB during insertion.
+type ParsedRow = (String, String, String);
 
 #[derive(Clone)]
 struct AppState {
@@ -205,10 +207,11 @@ struct ComparisonHistoryRow {
     id: Uuid,
     run_index: i64,
     run_name: String,
+    // The run's start time is also its creation time: a run is created only
+    // when processing begins, so no redundant database column is needed.
     created_at: String,
     processing_duration_ms: Option<i64>,
     processing_started_at: Option<String>,
-    processing_completed_at: Option<String>,
     old_layout_name: String,
     new_layout_name: String,
     old_date_of_download: Option<String>,
@@ -219,7 +222,7 @@ struct ComparisonHistoryRow {
 
 async fn list_comparisons(State(state): State<AppState>) -> ApiResult<Vec<ComparisonHistoryRow>> {
     Ok(Json(sqlx::query_as(
-        "SELECT run.id, run.run_index, run.run_name, run.created_at::text AS created_at, run.processing_duration_ms, run.processing_started_at::text AS processing_started_at, run.processing_completed_at::text AS processing_completed_at, old_layout.name AS old_layout_name, new_layout.name AS new_layout_name, run.old_date_of_download::text AS old_date_of_download, run.new_date_of_download::text AS new_date_of_download, run.old_origin_file_name, run.new_origin_file_name FROM comparison_runs run JOIN layouts old_layout ON old_layout.id = run.old_layout_id JOIN layouts new_layout ON new_layout.id = run.new_layout_id ORDER BY run.created_at DESC",
+        "SELECT run.id, run.run_index, run.run_name, run.processing_started_at::text AS created_at, run.processing_duration_ms, run.processing_started_at::text AS processing_started_at, old_layout.name AS old_layout_name, new_layout.name AS new_layout_name, run.old_date_of_download::text AS old_date_of_download, run.new_date_of_download::text AS new_date_of_download, run.old_origin_file_name, run.new_origin_file_name FROM comparison_runs run JOIN layouts old_layout ON old_layout.id = run.old_layout_id JOIN layouts new_layout ON new_layout.id = run.new_layout_id ORDER BY run.processing_started_at DESC",
     )
     .fetch_all(&state.pool)
     .await?))
@@ -295,7 +298,7 @@ async fn create_comparison(
                     fetch_layout(&state.pool, if is_old { old_id } else { new_id }).await?;
                 let index = run_index.ok_or_else(|| anyhow::anyhow!("run index is missing"))?;
                 let table = source_table_name(is_old, index);
-                let count = stream_load(&state.pool, field, &table, id, index, &layout).await?;
+                let count = stream_load(&state.pool, field, &table, id, &layout).await?;
                 if is_old {
                     old_rows = Some(count);
                 } else {
@@ -313,7 +316,7 @@ async fn create_comparison(
     let old_rows = old_rows.ok_or_else(|| anyhow::anyhow!("old file is required"))?;
     let new_rows = new_rows.ok_or_else(|| anyhow::anyhow!("new file is required"))?;
     compute_delta(&state.pool, comparison_id, run_index).await?;
-    sqlx::query("UPDATE comparison_runs SET processing_completed_at = now(), processing_duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - processing_started_at)) * 1000)::BIGINT) WHERE id = $1")
+    sqlx::query("UPDATE comparison_runs SET processing_duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - processing_started_at)) * 1000)::BIGINT) WHERE id = $1")
         .bind(comparison_id)
         .execute(&state.pool)
         .await?;
@@ -353,7 +356,7 @@ async fn create_source_tables(pool: &PgPool, run_index: i64) -> anyhow::Result<(
         let table = source_table_name(is_old, run_index);
         let composite_key_index = format!("{table}_composite_key_idx");
         sqlx::query(&format!(
-            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, comparison_id UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE, run_index BIGINT NOT NULL CHECK (run_index = {run_index}), composite_primary_key TEXT NOT NULL, row_hash CHAR(16) NOT NULL, data JSONB NOT NULL)"
+            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, comparison_id UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE, composite_primary_key TEXT NOT NULL, row_hash CHAR(16) NOT NULL, data JSONB NOT NULL)"
         ))
         .execute(pool)
         .await?;
@@ -371,7 +374,6 @@ async fn stream_load(
     mut file: axum::extract::multipart::Field<'_>,
     table: &str,
     comparison_id: Uuid,
-    run_index: i64,
     fields: &[LayoutField],
 ) -> anyhow::Result<u64> {
     let worker_count = parsing_worker_count();
@@ -411,14 +413,7 @@ async fn stream_load(
                     batch.push(row);
                     count += 1;
                     if batch.len() == INSERT_BATCH_SIZE {
-                        insert_batch(
-                            &writer_pool,
-                            &writer_table,
-                            comparison_id,
-                            run_index,
-                            &batch,
-                        )
-                        .await?;
+                        insert_batch(&writer_pool, &writer_table, comparison_id, &batch).await?;
                         batch.clear();
                     }
                 }
@@ -434,14 +429,7 @@ async fn stream_load(
             return Err(error);
         }
         if !batch.is_empty() {
-            insert_batch(
-                &writer_pool,
-                &writer_table,
-                comparison_id,
-                run_index,
-                &batch,
-            )
-            .await?;
+            insert_batch(&writer_pool, &writer_table, comparison_id, &batch).await?;
         }
         Ok::<u64, anyhow::Error>(count)
     });
@@ -479,8 +467,12 @@ async fn stream_load(
         worker.await.context("parsing worker panicked")?;
     }
     let write_result = writer.await.context("database writer task panicked")?;
+    // A database insertion failure closes the row receiver, which then makes
+    // parser workers exit. Prefer that original failure over the subsequent
+    // "workers stopped" symptom from the multipart reader.
+    let count = write_result?;
     read_result?;
-    write_result
+    Ok(count)
 }
 
 fn parsing_worker_count() -> usize {
@@ -520,28 +512,26 @@ fn parse_row(line: &[u8], fields: &[LayoutField]) -> anyhow::Result<Option<Parse
         data.insert(field.name.clone(), Value::String(value));
     }
     let composite_key = key_parts.join("\u{1f}");
-    let data = Value::Object(data);
-    let canonical_json = serde_json::to_vec(&data)?;
-    let row_hash = format!("{:016x}", xxh3_64(&canonical_json));
-    Ok(Some((composite_key, row_hash, data)))
+    let json = serde_json::to_string(&Value::Object(data))?;
+    let row_hash = format!("{:016x}", xxh3_64(json.as_bytes()));
+    Ok(Some((composite_key, row_hash, json)))
 }
 
 async fn insert_batch(
     pool: &PgPool,
     table: &str,
     comparison_id: Uuid,
-    run_index: i64,
-    rows: &[(String, String, Value)],
+    rows: &[ParsedRow],
 ) -> anyhow::Result<()> {
     let mut builder = QueryBuilder::<Postgres>::new(format!(
-        "INSERT INTO {table} (comparison_id, run_index, composite_primary_key, row_hash, data) "
+        "INSERT INTO {table} (comparison_id, composite_primary_key, row_hash, data) "
     ));
-    builder.push_values(rows, |mut row, (key, row_hash, data)| {
+    builder.push_values(rows, |mut row, (key, row_hash, json)| {
         row.push_bind(comparison_id)
-            .push_bind(run_index)
             .push_bind(key)
             .push_bind(row_hash)
-            .push_bind(sqlx::types::Json(data));
+            .push_bind(json)
+            .push_unseparated("::jsonb");
     });
     builder.build().execute(pool).await?;
     Ok(())
@@ -550,9 +540,48 @@ async fn insert_batch(
 async fn compute_delta(pool: &PgPool, id: Uuid, run_index: i64) -> anyhow::Result<()> {
     let old_table = source_table_name(true, run_index);
     let new_table = source_table_name(false, run_index);
-    sqlx::query(&format!("WITH changed AS MATERIALIZED (SELECT o.composite_primary_key, o.data AS old_data, n.data AS new_data FROM {old_table} o JOIN {new_table} n ON n.composite_primary_key = o.composite_primary_key WHERE o.comparison_id = $1 AND o.row_hash <> n.row_hash AND o.data IS DISTINCT FROM n.data) INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, new_data, changed_fields) SELECT $1, changed.composite_primary_key, 'modified', changed.old_data, changed.new_data, COALESCE(jsonb_object_agg(k, jsonb_build_object('old', changed.old_data -> k, 'new', changed.new_data -> k)) FILTER (WHERE (changed.old_data -> k) IS DISTINCT FROM (changed.new_data -> k)), '{{}}'::jsonb) FROM changed CROSS JOIN LATERAL jsonb_object_keys(changed.old_data || changed.new_data) AS k GROUP BY changed.composite_primary_key, changed.old_data, changed.new_data")).bind(id).execute(pool).await?;
-    sqlx::query(&format!("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, changed_fields) SELECT $1, o.composite_primary_key, 'removed', o.data, '{{}}'::jsonb FROM {old_table} o LEFT JOIN {new_table} n ON n.composite_primary_key = o.composite_primary_key WHERE o.comparison_id = $1 AND n.id IS NULL")).bind(id).execute(pool).await?;
-    sqlx::query(&format!("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, new_data, changed_fields) SELECT $1, n.composite_primary_key, 'added', n.data, '{{}}'::jsonb FROM {new_table} n LEFT JOIN {old_table} o ON o.composite_primary_key = n.composite_primary_key WHERE n.comparison_id = $1 AND o.id IS NULL")).bind(id).execute(pool).await?;
+    // Aggregate the JSON field diff per modified row. This preserves the
+    // indexed source-table join while avoiding the former global aggregate
+    // across every changed row and every JSON field.
+    sqlx::query(
+        &format!("WITH changed AS MATERIALIZED (
+            SELECT o.composite_primary_key, o.data AS old_data, n.data AS new_data
+            FROM {old_table} o
+            JOIN {new_table} n
+                ON n.composite_primary_key = o.composite_primary_key
+            WHERE o.comparison_id = $1
+                AND o.row_hash <> n.row_hash
+                AND o.data IS DISTINCT FROM n.data
+        )
+        INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, new_data, changed_fields)
+        SELECT
+            $1,
+            changed.composite_primary_key,
+            'modified',
+            changed.old_data,
+            changed.new_data,
+            COALESCE(diff.changed_fields, '{{}}'::jsonb)
+        FROM changed
+        CROSS JOIN LATERAL (
+            SELECT jsonb_object_agg(
+                key,
+                jsonb_build_object('old', changed.old_data -> key, 'new', changed.new_data -> key)
+            ) AS changed_fields
+            FROM jsonb_object_keys(changed.old_data || changed.new_data) AS key
+            WHERE (changed.old_data -> key) IS DISTINCT FROM (changed.new_data -> key)
+        ) AS diff"),
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, old_data, changed_fields) SELECT $1, o.composite_primary_key, 'removed', o.data, '{{}}'::jsonb FROM {old_table} o LEFT JOIN {new_table} n ON n.composite_primary_key = o.composite_primary_key WHERE o.comparison_id = $1 AND n.id IS NULL"))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    sqlx::query(&format!("INSERT INTO delta_rows (comparison_id, composite_primary_key, change_type, new_data, changed_fields) SELECT $1, n.composite_primary_key, 'added', n.data, '{{}}'::jsonb FROM {new_table} n LEFT JOIN {old_table} o ON o.composite_primary_key = n.composite_primary_key WHERE n.comparison_id = $1 AND o.id IS NULL"))
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -605,7 +634,8 @@ mod tests {
         ];
         let row = parse_row(b"01ALICE123", &fields).unwrap().unwrap();
         assert_eq!(row.0, "01\u{1f}123");
-        assert_eq!(row.2["name"], "ALICE");
+        let data: Value = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(data["name"], "ALICE");
         assert_eq!(row.1.len(), 16);
     }
 

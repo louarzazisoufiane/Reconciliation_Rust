@@ -9,7 +9,6 @@ export interface ComparisonRun {
   created_at: string;
   processing_duration_ms: number | null;
   processing_started_at: string | null;
-  processing_completed_at: string | null;
   old_layout_name: string;
   new_layout_name: string;
   old_date_of_download: string | null;
