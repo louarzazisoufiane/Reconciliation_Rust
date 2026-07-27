@@ -434,7 +434,7 @@ async fn validate_schedule_request(request: &mut CreateScheduledRequest) -> anyh
     Ok(())
 }
 
-git const SCHEDULE_FIELDS: &str = "id, name, frequency, run_at::text AS run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path, status, created_at::text AS created_at, last_run_at::text AS last_run_at, error_message";
+const SCHEDULE_FIELDS: &str = "id, name, frequency, run_at::text AS run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path, status, created_at::text AS created_at, last_run_at::text AS last_run_at, error_message";
 const SCHEDULE_SELECT: &str = "SELECT id, name, frequency, run_at::text AS run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path, status, created_at::text AS created_at, last_run_at::text AS last_run_at, error_message FROM scheduled";
 
 async fn list_scheduled(
