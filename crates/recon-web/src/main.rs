@@ -1,16 +1,19 @@
 mod assets;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::{
+    collections::HashSet,
+    path::{Path as FsPath, PathBuf},
+};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -18,7 +21,11 @@ use sqlx::{
     FromRow, PgPool, Postgres, QueryBuilder,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    sync::mpsc,
+    time::{self, Duration},
+};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -55,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     MIGRATOR.run(&pool).await?;
     let state = AppState { pool };
+    tokio::spawn(scheduled_worker(state.clone()));
     let api = Router::new()
         .route("/layouts", get(list_layouts).post(create_layout))
         .route(
@@ -62,6 +70,14 @@ async fn main() -> anyhow::Result<()> {
             get(list_comparisons).post(create_comparison),
         )
         .route("/comparisons/{id}/delta", get(list_delta))
+        .route("/scheduled", get(list_scheduled).post(create_scheduled))
+        .route(
+            "/scheduled/{id}",
+            get(get_scheduled)
+                .put(update_scheduled)
+                .delete(delete_scheduled),
+        )
+        .route("/scheduled/{id}/run-now", post(run_scheduled_now))
         .with_state(state);
     // Multipart is streamed and rows are batched below; do not impose Axum's
     // small default request-body cap on large fixed-width source files.
@@ -346,6 +362,451 @@ async fn fetch_layout(pool: &PgPool, id: Uuid) -> anyhow::Result<Vec<LayoutField
     Ok(fields.0)
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateScheduledRequest {
+    name: String,
+    frequency: String,
+    run_at: String,
+    old_path: String,
+    new_path: String,
+    old_layout_id: Uuid,
+    new_layout_id: Uuid,
+    archive_path: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct ScheduledTask {
+    id: Uuid,
+    name: String,
+    frequency: String,
+    run_at: String,
+    old_path: String,
+    new_path: String,
+    old_layout_id: Uuid,
+    new_layout_id: Uuid,
+    archive_path: String,
+    status: String,
+    created_at: String,
+    last_run_at: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScheduledFilter {
+    status: Option<String>,
+}
+
+async fn validate_schedule_request(request: &mut CreateScheduledRequest) -> anyhow::Result<()> {
+    request.name = request.name.trim().to_owned();
+    for value in [
+        &mut request.old_path,
+        &mut request.new_path,
+        &mut request.archive_path,
+    ] {
+        *value = value.trim().to_owned();
+    }
+    if request.name.is_empty() {
+        anyhow::bail!("schedule name is required");
+    }
+    if !matches!(
+        request.frequency.as_str(),
+        "one_time" | "daily" | "weekly" | "monthly"
+    ) {
+        anyhow::bail!("frequency must be one_time, daily, weekly, or monthly");
+    }
+    if request.archive_path.is_empty() {
+        anyhow::bail!("archive path is required");
+    }
+    for (label, path) in [
+        ("old path", &request.old_path),
+        ("new path", &request.new_path),
+    ] {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("{label} does not exist or cannot be read"))?;
+        if !metadata.is_dir() {
+            anyhow::bail!("{label} must be a directory");
+        }
+        let _directory = tokio::fs::read_dir(path)
+            .await
+            .with_context(|| format!("{label} is not readable"))?;
+    }
+    Ok(())
+}
+
+git const SCHEDULE_FIELDS: &str = "id, name, frequency, run_at::text AS run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path, status, created_at::text AS created_at, last_run_at::text AS last_run_at, error_message";
+const SCHEDULE_SELECT: &str = "SELECT id, name, frequency, run_at::text AS run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path, status, created_at::text AS created_at, last_run_at::text AS last_run_at, error_message FROM scheduled";
+
+async fn list_scheduled(
+    State(state): State<AppState>,
+    Query(filter): Query<ScheduledFilter>,
+) -> ApiResult<Vec<ScheduledTask>> {
+    let rows = match filter.status.as_deref() {
+        Some("all") => {
+            sqlx::query_as(&format!("{SCHEDULE_SELECT} ORDER BY run_at"))
+                .fetch_all(&state.pool)
+                .await?
+        }
+        Some("pending") | None => {
+            sqlx::query_as(&format!(
+                "{SCHEDULE_SELECT} WHERE status IN ('pending', 'failed') ORDER BY run_at"
+            ))
+            .fetch_all(&state.pool)
+            .await?
+        }
+        Some(status) => {
+            sqlx::query_as(&format!(
+                "{SCHEDULE_SELECT} WHERE status = $1 ORDER BY run_at"
+            ))
+            .bind(status)
+            .fetch_all(&state.pool)
+            .await?
+        }
+    };
+    Ok(Json(rows))
+}
+
+async fn get_scheduled(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<ScheduledTask> {
+    let task = sqlx::query_as(&format!("{SCHEDULE_SELECT} WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("scheduled task not found"))?;
+    Ok(Json(task))
+}
+
+async fn create_scheduled(
+    State(state): State<AppState>,
+    Json(mut request): Json<CreateScheduledRequest>,
+) -> ApiResult<ScheduledTask> {
+    validate_schedule_request(&mut request).await?;
+    let id = Uuid::new_v4();
+    let task = sqlx::query_as(&format!("INSERT INTO scheduled (id, name, frequency, run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path) VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7, $8, $9) RETURNING {SCHEDULE_FIELDS}"))
+        .bind(id).bind(&request.name).bind(&request.frequency).bind(&request.run_at)
+        .bind(&request.old_path).bind(&request.new_path).bind(request.old_layout_id)
+        .bind(request.new_layout_id).bind(&request.archive_path)
+        .fetch_one(&state.pool).await?;
+    Ok(Json(task))
+}
+
+async fn update_scheduled(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut request): Json<CreateScheduledRequest>,
+) -> ApiResult<ScheduledTask> {
+    validate_schedule_request(&mut request).await?;
+    let task = sqlx::query_as(&format!("UPDATE scheduled SET name = $2, frequency = $3, run_at = $4::timestamptz, old_path = $5, new_path = $6, old_layout_id = $7, new_layout_id = $8, archive_path = $9, status = 'pending', error_message = NULL WHERE id = $1 RETURNING {SCHEDULE_FIELDS}"))
+        .bind(id).bind(&request.name).bind(&request.frequency).bind(&request.run_at)
+        .bind(&request.old_path).bind(&request.new_path).bind(request.old_layout_id)
+        .bind(request.new_layout_id).bind(&request.archive_path)
+        .fetch_optional(&state.pool).await?
+        .ok_or_else(|| anyhow::anyhow!("scheduled task not found"))?;
+    Ok(Json(task))
+}
+
+async fn delete_scheduled(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let result = sqlx::query("DELETE FROM scheduled WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError(anyhow::anyhow!("scheduled task not found")));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_scheduled_now(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let task = claim_scheduled(&state.pool, Some(id))
+        .await?
+        .ok_or_else(|| AppError(anyhow::anyhow!("scheduled task is not pending or failed")))?;
+    tokio::spawn(execute_scheduled(state, task));
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn scheduled_worker(state: AppState) {
+    let mut interval = time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        while let Ok(Some(task)) = claim_scheduled(&state.pool, None).await {
+            execute_scheduled(state.clone(), task).await;
+        }
+    }
+}
+
+async fn claim_scheduled(
+    pool: &PgPool,
+    requested_id: Option<Uuid>,
+) -> anyhow::Result<Option<ScheduledTask>> {
+    let condition = if requested_id.is_some() {
+        "id = $1 AND status IN ('pending', 'failed')"
+    } else {
+        "status = 'pending' AND run_at <= now()"
+    };
+    // The lock is taken inside the CTE and the status update occurs in the
+    // same statement, so multiple application instances cannot claim a run.
+    let sql = format!(
+        "WITH candidate AS (SELECT id FROM scheduled WHERE {condition} ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE scheduled s SET status = 'running', error_message = NULL FROM candidate WHERE s.id = candidate.id RETURNING s.id, s.name, s.frequency, s.run_at::text AS run_at, s.old_path, s.new_path, s.old_layout_id, s.new_layout_id, s.archive_path, s.status, s.created_at::text AS created_at, s.last_run_at::text AS last_run_at, s.error_message"
+    );
+    let query = sqlx::query_as::<_, ScheduledTask>(&sql);
+    let task = if let Some(id) = requested_id {
+        query.bind(id).fetch_optional(pool).await?
+    } else {
+        query.fetch_optional(pool).await?
+    };
+    Ok(task)
+}
+
+#[derive(Clone)]
+struct ScheduledFile {
+    path: PathBuf,
+    relative: PathBuf,
+    filename: String,
+}
+
+async fn scan_schedule_files(root: &FsPath) -> anyhow::Result<Vec<ScheduledFile>> {
+    let mut result = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .context("file escaped scheduled root")?
+                    .to_path_buf();
+                let filename = entry.file_name().to_string_lossy().into_owned();
+                result.push(ScheduledFile {
+                    path,
+                    relative,
+                    filename,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Clone)]
+struct MatchedFiles {
+    old: ScheduledFile,
+    new: ScheduledFile,
+    chunks: Vec<String>,
+    score: usize,
+}
+
+fn common_chunks(left: &str, right: &str) -> Vec<String> {
+    // Repeatedly take the longest contiguous shared block and mask it in both
+    // names. This produces non-overlapping chunks while retaining every block
+    // used to calculate the resemblance score.
+    let mut a = left.as_bytes().to_vec();
+    let mut b = right.as_bytes().to_vec();
+    let mut found: Vec<(usize, String)> = Vec::new();
+    loop {
+        let mut best = (0usize, 0usize, 0usize);
+        for i in 0..a.len() {
+            if a[i] == 0 {
+                continue;
+            }
+            for j in 0..b.len() {
+                if a[i] != b[j] || b[j] == 0 {
+                    continue;
+                }
+                let mut length = 0;
+                while i + length < a.len()
+                    && j + length < b.len()
+                    && a[i + length] != 0
+                    && a[i + length] == b[j + length]
+                {
+                    length += 1;
+                }
+                if length > best.2 {
+                    best = (i, j, length);
+                }
+            }
+        }
+        if best.2 == 0 {
+            break;
+        }
+        found.push((
+            best.0,
+            String::from_utf8_lossy(&a[best.0..best.0 + best.2]).into_owned(),
+        ));
+        a[best.0..best.0 + best.2].fill(0);
+        b[best.1..best.1 + best.2].fill(0);
+    }
+    found.sort_by_key(|(position, _)| *position);
+    found.into_iter().map(|(_, chunk)| chunk).collect()
+}
+
+fn match_scheduled_files(
+    old: Vec<ScheduledFile>,
+    new: Vec<ScheduledFile>,
+    processed: &HashSet<(String, String)>,
+) -> Vec<MatchedFiles> {
+    let mut old: Vec<_> = old.into_iter().collect();
+    let mut new: Vec<_> = new.into_iter().collect();
+    let mut matches = Vec::new();
+    for old_file in &old {
+        if new
+            .iter()
+            .all(|new_file| common_chunks(&old_file.filename, &new_file.filename).is_empty())
+        {
+            tracing::warn!(file = %old_file.filename, "skipping old scheduled file with no filename resemblance");
+        }
+    }
+    for new_file in &new {
+        if old
+            .iter()
+            .all(|old_file| common_chunks(&old_file.filename, &new_file.filename).is_empty())
+        {
+            tracing::warn!(file = %new_file.filename, "skipping new scheduled file with no filename resemblance");
+        }
+    }
+    loop {
+        let mut best: Option<(usize, usize, Vec<String>)> = None;
+        for (old_index, old_file) in old.iter().enumerate() {
+            for (new_index, new_file) in new.iter().enumerate() {
+                if processed.contains(&(
+                    old_file.relative.to_string_lossy().into_owned(),
+                    new_file.relative.to_string_lossy().into_owned(),
+                )) {
+                    continue;
+                }
+                let chunks = common_chunks(&old_file.filename, &new_file.filename);
+                let score = chunks.iter().map(String::len).sum::<usize>();
+                if score
+                    > best
+                        .as_ref()
+                        .map_or(0, |item| item.2.iter().map(String::len).sum())
+                {
+                    best = Some((old_index, new_index, chunks));
+                }
+            }
+        }
+        let Some((old_index, new_index, chunks)) = best else {
+            break;
+        };
+        let score = chunks.iter().map(String::len).sum();
+        if score == 0 {
+            break;
+        }
+        let new_file = new.remove(new_index);
+        let old_file = old.remove(old_index);
+        matches.push(MatchedFiles {
+            old: old_file,
+            new: new_file,
+            chunks,
+            score,
+        });
+    }
+    matches
+}
+
+fn scheduled_run_name(id: Uuid, chunks: &[String]) -> String {
+    let suffix: String = chunks
+        .concat()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let mut name = format!("scheduled_{id}_{suffix}");
+    name.truncate(100);
+    name
+}
+
+async fn archive_file(source: &FsPath, destination: &FsPath) -> anyhow::Result<()> {
+    let parent = destination
+        .parent()
+        .context("archive destination has no parent")?;
+    tokio::fs::create_dir_all(parent).await?;
+    match tokio::fs::rename(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            tracing::debug!(%rename_error, source = %source.display(), "rename failed; using copy/delete archive fallback");
+            tokio::fs::copy(source, destination).await?;
+            tokio::fs::remove_file(source).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn execute_scheduled(state: AppState, task: ScheduledTask) {
+    let result = async {
+        let processed: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>("SELECT old_filename, new_filename FROM scheduled_runs WHERE scheduled_id = $1")
+            .bind(task.id).fetch_all(&state.pool).await?.into_iter().collect();
+        let old_files = scan_schedule_files(FsPath::new(&task.old_path)).await?;
+        let new_files = scan_schedule_files(FsPath::new(&task.new_path)).await?;
+        let pairs = match_scheduled_files(old_files, new_files, &processed);
+        for pair in pairs {
+            tracing::info!(scheduled_id = %task.id, score = pair.score, old = %pair.old.filename, new = %pair.new.filename, "processing scheduled file pair");
+            let comparison_id = create_comparison_from_paths(&state.pool, &task, &pair).await?;
+            let old_archive = FsPath::new(&task.archive_path).join("matching/old").join(&pair.old.relative);
+            let new_archive = FsPath::new(&task.archive_path).join("matching/new").join(&pair.new.relative);
+            // Record only after both files are archived. If the second move
+            // fails, restore the first file where possible for a later retry.
+            let old_moved = match archive_file(&pair.old.path, &old_archive).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, file = %pair.old.path.display(), "could not archive old file");
+                    false
+                }
+            };
+            let new_moved = match archive_file(&pair.new.path, &new_archive).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, file = %pair.new.path.display(), "could not archive new file");
+                    false
+                }
+            };
+            if old_moved && new_moved {
+                sqlx::query("INSERT INTO scheduled_runs (scheduled_id, comparison_id, old_filename, new_filename) SELECT $1, $2, $3, $4 WHERE EXISTS (SELECT 1 FROM scheduled WHERE id = $1) ON CONFLICT (scheduled_id, old_filename, new_filename) DO NOTHING")
+                    .bind(task.id).bind(comparison_id).bind(pair.old.relative.to_string_lossy().as_ref()).bind(pair.new.relative.to_string_lossy().as_ref()).execute(&state.pool).await?;
+            } else {
+                if old_moved { if let Err(error) = archive_file(&old_archive, &pair.old.path).await { tracing::warn!(%error, "could not restore partially archived old file"); } }
+                if new_moved { if let Err(error) = archive_file(&new_archive, &pair.new.path).await { tracing::warn!(%error, "could not restore partially archived new file"); } }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    match result {
+        Ok(()) => {
+            let completion = "UPDATE scheduled SET status = CASE WHEN frequency = 'one_time' THEN 'completed' ELSE 'pending' END, run_at = CASE frequency WHEN 'daily' THEN run_at + interval '1 day' WHEN 'weekly' THEN run_at + interval '7 days' WHEN 'monthly' THEN run_at + interval '1 month' ELSE run_at END, last_run_at = now(), error_message = NULL WHERE id = $1";
+            if let Err(error) = sqlx::query(completion)
+                .bind(task.id)
+                .execute(&state.pool)
+                .await
+            {
+                tracing::error!(%error, scheduled_id = %task.id, "could not complete scheduled task");
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, scheduled_id = %task.id, "scheduled task failed");
+            if let Err(update_error) = sqlx::query(
+                "UPDATE scheduled SET status = 'failed', error_message = $2 WHERE id = $1",
+            )
+            .bind(task.id)
+            .bind(error.to_string())
+            .execute(&state.pool)
+            .await
+            {
+                tracing::error!(%update_error, scheduled_id = %task.id, "could not store scheduled task failure");
+            }
+        }
+    }
+}
+
 fn source_table_name(is_old: bool, run_index: i64) -> String {
     let prefix = if is_old { "old_rows" } else { "new_rows" };
     format!("{prefix}_{run_index}")
@@ -367,6 +828,139 @@ async fn create_source_tables(pool: &PgPool, run_index: i64) -> anyhow::Result<(
         .await?;
     }
     Ok(())
+}
+
+async fn create_comparison_from_paths(
+    pool: &PgPool,
+    task: &ScheduledTask,
+    pair: &MatchedFiles,
+) -> anyhow::Result<Uuid> {
+    let old_layout = fetch_layout(pool, task.old_layout_id).await?;
+    let new_layout = fetch_layout(pool, task.new_layout_id).await?;
+    let id = Uuid::new_v4();
+    let run_name = scheduled_run_name(task.id, &pair.chunks);
+    let run_index: i64 = sqlx::query_scalar("INSERT INTO comparison_runs (id, run_name, old_layout_id, new_layout_id, old_date_of_download, old_origin_file_name, new_date_of_download, new_origin_file_name, processing_started_at) VALUES ($1, $2, $3, $4, now(), $5, now(), $6, now()) RETURNING run_index")
+        .bind(id).bind(run_name).bind(task.old_layout_id).bind(task.new_layout_id)
+        .bind(&pair.old.filename).bind(&pair.new.filename).fetch_one(pool).await?;
+    create_source_tables(pool, run_index).await?;
+    let old_file = tokio::fs::File::open(&pair.old.path)
+        .await
+        .with_context(|| format!("cannot read old file {}", pair.old.path.display()))?;
+    let old_rows = stream_load_reader(
+        pool,
+        old_file,
+        &source_table_name(true, run_index),
+        id,
+        &old_layout,
+    )
+    .await?;
+    let new_file = tokio::fs::File::open(&pair.new.path)
+        .await
+        .with_context(|| format!("cannot read new file {}", pair.new.path.display()))?;
+    let _new_rows = stream_load_reader(
+        pool,
+        new_file,
+        &source_table_name(false, run_index),
+        id,
+        &new_layout,
+    )
+    .await?;
+    compute_delta(pool, id, run_index).await?;
+    sqlx::query("UPDATE comparison_runs SET processing_duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - processing_started_at)) * 1000)::BIGINT) WHERE id = $1")
+        .bind(id).execute(pool).await?;
+    tracing::info!(comparison_id = %id, old_rows, "scheduled comparison completed");
+    Ok(id)
+}
+
+async fn stream_load_reader(
+    pool: &PgPool,
+    file: tokio::fs::File,
+    table: &str,
+    comparison_id: Uuid,
+    fields: &[LayoutField],
+) -> anyhow::Result<u64> {
+    let worker_count = parsing_worker_count();
+    let per_worker_queue_capacity = (PARSE_WORK_QUEUE_CAPACITY / worker_count).max(1);
+    let (row_sender, mut row_receiver) = mpsc::channel(PARSE_RESULT_QUEUE_CAPACITY);
+    let mut line_senders = Vec::with_capacity(worker_count);
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let (line_sender, mut line_receiver) = mpsc::channel::<Vec<u8>>(per_worker_queue_capacity);
+        line_senders.push(line_sender);
+        let sender = row_sender.clone();
+        let fields = fields.to_vec();
+        workers.push(tokio::task::spawn_blocking(move || {
+            while let Some(line) = line_receiver.blocking_recv() {
+                if sender.blocking_send(parse_row(&line, &fields)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(row_sender);
+    let writer_pool = pool.clone();
+    let writer_table = table.to_owned();
+    let writer = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(INSERT_BATCH_SIZE);
+        let mut count = 0;
+        let mut parse_error = None;
+        while let Some(parsed) = row_receiver.recv().await {
+            match parsed {
+                Ok(Some(row)) if parse_error.is_none() => {
+                    count += 1;
+                    batch.push(row);
+                    if batch.len() == INSERT_BATCH_SIZE {
+                        insert_batch(&writer_pool, &writer_table, comparison_id, &batch).await?;
+                        batch.clear();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    parse_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = parse_error {
+            return Err(error);
+        }
+        if !batch.is_empty() {
+            insert_batch(&writer_pool, &writer_table, comparison_id, &batch).await?;
+        }
+        Ok::<u64, anyhow::Error>(count)
+    });
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut next_worker = 0;
+    let read_result = async {
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line).await?;
+            if read == 0 {
+                break;
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            line_senders[next_worker]
+                .send(std::mem::take(&mut line))
+                .await
+                .map_err(|_| anyhow::anyhow!("parsing workers stopped unexpectedly"))?;
+            next_worker = (next_worker + 1) % worker_count;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    drop(line_senders);
+    for worker in workers {
+        worker.await.context("parsing worker panicked")?;
+    }
+    let write_result = writer.await.context("database writer task panicked")?;
+    let count = write_result?;
+    read_result?;
+    Ok(count)
 }
 
 async fn stream_load(
@@ -668,5 +1262,15 @@ mod tests {
             is_primary_key: false,
         }];
         assert!(validate_layout(&fields).is_err());
+    }
+
+    #[test]
+    fn filename_chunks_are_non_overlapping_and_ordered() {
+        let chunks = common_chunks("ABC_DEF_001.dat", "ABC_DEF_002.dat");
+        assert_eq!(chunks.concat(), "ABC_DEF_00.dat");
+        assert_eq!(
+            scheduled_run_name(Uuid::nil(), &chunks),
+            "scheduled_00000000-0000-0000-0000-000000000000_ABC_DEF_00_dat"
+        );
     }
 }
