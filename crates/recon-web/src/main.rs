@@ -234,11 +234,16 @@ struct ComparisonHistoryRow {
     new_date_of_download: Option<String>,
     old_origin_file_name: Option<String>,
     new_origin_file_name: Option<String>,
+    old_row_count: Option<i64>,
+    new_row_count: Option<i64>,
+    added: i64,
+    removed: i64,
+    modified: i64,
 }
 
 async fn list_comparisons(State(state): State<AppState>) -> ApiResult<Vec<ComparisonHistoryRow>> {
     Ok(Json(sqlx::query_as(
-        "SELECT run.id, run.run_index, run.run_name, run.processing_started_at::text AS created_at, run.processing_duration_ms, run.processing_started_at::text AS processing_started_at, old_layout.name AS old_layout_name, new_layout.name AS new_layout_name, run.old_date_of_download::text AS old_date_of_download, run.new_date_of_download::text AS new_date_of_download, run.old_origin_file_name, run.new_origin_file_name FROM comparison_runs run JOIN layouts old_layout ON old_layout.id = run.old_layout_id JOIN layouts new_layout ON new_layout.id = run.new_layout_id ORDER BY run.processing_started_at DESC",
+        "SELECT run.id, run.run_index, run.run_name, run.processing_started_at::text AS created_at, run.processing_duration_ms, run.processing_started_at::text AS processing_started_at, old_layout.name AS old_layout_name, new_layout.name AS new_layout_name, run.old_date_of_download::text AS old_date_of_download, run.new_date_of_download::text AS new_date_of_download, run.old_origin_file_name, run.new_origin_file_name, run.old_row_count, run.new_row_count, (SELECT count(*) FROM delta_rows delta WHERE delta.comparison_id = run.id AND delta.change_type = 'added') AS added, (SELECT count(*) FROM delta_rows delta WHERE delta.comparison_id = run.id AND delta.change_type = 'removed') AS removed, (SELECT count(*) FROM delta_rows delta WHERE delta.comparison_id = run.id AND delta.change_type = 'modified') AS modified FROM comparison_runs run JOIN layouts old_layout ON old_layout.id = run.old_layout_id JOIN layouts new_layout ON new_layout.id = run.new_layout_id ORDER BY run.processing_started_at DESC",
     )
     .fetch_all(&state.pool)
     .await?))
@@ -331,6 +336,12 @@ async fn create_comparison(
     let run_index = run_index.ok_or_else(|| anyhow::anyhow!("run index is required"))?;
     let old_rows = old_rows.ok_or_else(|| anyhow::anyhow!("old file is required"))?;
     let new_rows = new_rows.ok_or_else(|| anyhow::anyhow!("new file is required"))?;
+    sqlx::query("UPDATE comparison_runs SET old_row_count = $2, new_row_count = $3 WHERE id = $1")
+        .bind(comparison_id)
+        .bind(old_rows as i64)
+        .bind(new_rows as i64)
+        .execute(&state.pool)
+        .await?;
     compute_delta(&state.pool, comparison_id, run_index).await?;
     sqlx::query("UPDATE comparison_runs SET processing_duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - processing_started_at)) * 1000)::BIGINT) WHERE id = $1")
         .bind(comparison_id)
@@ -376,7 +387,7 @@ struct CreateScheduledRequest {
 
 #[derive(Debug, Serialize, FromRow)]
 struct ScheduledTask {
-    id: Uuid,
+    id: i64,
     name: String,
     frequency: String,
     run_at: String,
@@ -441,34 +452,33 @@ async fn list_scheduled(
     State(state): State<AppState>,
     Query(filter): Query<ScheduledFilter>,
 ) -> ApiResult<Vec<ScheduledTask>> {
-    let rows = match filter.status.as_deref() {
-        Some("all") => {
-            sqlx::query_as(&format!("{SCHEDULE_SELECT} ORDER BY run_at"))
+    let rows =
+        match filter.status.as_deref() {
+            Some("all") | None => {
+                sqlx::query_as(&format!("{SCHEDULE_SELECT} ORDER BY run_at"))
+                    .fetch_all(&state.pool)
+                    .await?
+            }
+            Some("pending") => sqlx::query_as(&format!(
+                "{SCHEDULE_SELECT} WHERE status IN ('pending', 'running', 'failed') ORDER BY run_at"
+            ))
+            .fetch_all(&state.pool)
+            .await?,
+            Some(status) => {
+                sqlx::query_as(&format!(
+                    "{SCHEDULE_SELECT} WHERE status = $1 ORDER BY run_at"
+                ))
+                .bind(status)
                 .fetch_all(&state.pool)
                 .await?
-        }
-        Some("pending") | None => {
-            sqlx::query_as(&format!(
-                "{SCHEDULE_SELECT} WHERE status IN ('pending', 'failed') ORDER BY run_at"
-            ))
-            .fetch_all(&state.pool)
-            .await?
-        }
-        Some(status) => {
-            sqlx::query_as(&format!(
-                "{SCHEDULE_SELECT} WHERE status = $1 ORDER BY run_at"
-            ))
-            .bind(status)
-            .fetch_all(&state.pool)
-            .await?
-        }
-    };
+            }
+        };
     Ok(Json(rows))
 }
 
 async fn get_scheduled(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<i64>,
 ) -> ApiResult<ScheduledTask> {
     let task = sqlx::query_as(&format!("{SCHEDULE_SELECT} WHERE id = $1"))
         .bind(id)
@@ -483,9 +493,8 @@ async fn create_scheduled(
     Json(mut request): Json<CreateScheduledRequest>,
 ) -> ApiResult<ScheduledTask> {
     validate_schedule_request(&mut request).await?;
-    let id = Uuid::new_v4();
-    let task = sqlx::query_as(&format!("INSERT INTO scheduled (id, name, frequency, run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path) VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7, $8, $9) RETURNING {SCHEDULE_FIELDS}"))
-        .bind(id).bind(&request.name).bind(&request.frequency).bind(&request.run_at)
+    let task = sqlx::query_as(&format!("INSERT INTO scheduled (name, frequency, run_at, old_path, new_path, old_layout_id, new_layout_id, archive_path) VALUES ($1, $2, $3::timestamptz, $4, $5, $6, $7, $8) RETURNING {SCHEDULE_FIELDS}"))
+        .bind(&request.name).bind(&request.frequency).bind(&request.run_at)
         .bind(&request.old_path).bind(&request.new_path).bind(request.old_layout_id)
         .bind(request.new_layout_id).bind(&request.archive_path)
         .fetch_one(&state.pool).await?;
@@ -494,7 +503,7 @@ async fn create_scheduled(
 
 async fn update_scheduled(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<i64>,
     Json(mut request): Json<CreateScheduledRequest>,
 ) -> ApiResult<ScheduledTask> {
     validate_schedule_request(&mut request).await?;
@@ -509,7 +518,7 @@ async fn update_scheduled(
 
 async fn delete_scheduled(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
     let result = sqlx::query("DELETE FROM scheduled WHERE id = $1")
         .bind(id)
@@ -523,7 +532,7 @@ async fn delete_scheduled(
 
 async fn run_scheduled_now(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
     let task = claim_scheduled(&state.pool, Some(id))
         .await?
@@ -544,7 +553,7 @@ async fn scheduled_worker(state: AppState) {
 
 async fn claim_scheduled(
     pool: &PgPool,
-    requested_id: Option<Uuid>,
+    requested_id: Option<i64>,
 ) -> anyhow::Result<Option<ScheduledTask>> {
     let condition = if requested_id.is_some() {
         "id = $1 AND status IN ('pending', 'failed')"
@@ -715,7 +724,7 @@ fn match_scheduled_files(
     matches
 }
 
-fn scheduled_run_name(id: Uuid, chunks: &[String]) -> String {
+fn scheduled_run_name(id: i64, chunks: &[String]) -> String {
     let suffix: String = chunks
         .concat()
         .chars()
@@ -857,7 +866,7 @@ async fn create_comparison_from_paths(
     let new_file = tokio::fs::File::open(&pair.new.path)
         .await
         .with_context(|| format!("cannot read new file {}", pair.new.path.display()))?;
-    let _new_rows = stream_load_reader(
+    let new_rows = stream_load_reader(
         pool,
         new_file,
         &source_table_name(false, run_index),
@@ -865,6 +874,12 @@ async fn create_comparison_from_paths(
         &new_layout,
     )
     .await?;
+    sqlx::query("UPDATE comparison_runs SET old_row_count = $2, new_row_count = $3 WHERE id = $1")
+        .bind(id)
+        .bind(old_rows as i64)
+        .bind(new_rows as i64)
+        .execute(pool)
+        .await?;
     compute_delta(pool, id, run_index).await?;
     sqlx::query("UPDATE comparison_runs SET processing_duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - processing_started_at)) * 1000)::BIGINT) WHERE id = $1")
         .bind(id).execute(pool).await?;
@@ -1269,8 +1284,8 @@ mod tests {
         let chunks = common_chunks("ABC_DEF_001.dat", "ABC_DEF_002.dat");
         assert_eq!(chunks.concat(), "ABC_DEF_00.dat");
         assert_eq!(
-            scheduled_run_name(Uuid::nil(), &chunks),
-            "scheduled_00000000-0000-0000-0000-000000000000_ABC_DEF_00_dat"
+            scheduled_run_name(42, &chunks),
+            "scheduled_42_ABC_DEF_00_dat"
         );
     }
 }

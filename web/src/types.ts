@@ -15,9 +15,14 @@ export interface ComparisonRun {
   new_date_of_download: string | null;
   old_origin_file_name: string | null;
   new_origin_file_name: string | null;
+  old_row_count: number | null;
+  new_row_count: number | null;
+  added: number;
+  removed: number;
+  modified: number;
 }
 export interface DeltaRow { composite_primary_key: string; change_type: "modified" | "added" | "removed"; old_data: Record<string, string> | null; new_data: Record<string, string> | null; changed_fields: Record<string, { old: string | null; new: string | null }>; }
 export type ScheduleFrequency = "one_time" | "daily" | "weekly" | "monthly";
 export type ScheduleStatus = "pending" | "running" | "completed" | "failed";
-export interface ScheduledTask { id: string; name: string; frequency: ScheduleFrequency; run_at: string; old_path: string; new_path: string; old_layout_id: string; new_layout_id: string; archive_path: string; status: ScheduleStatus; created_at: string; last_run_at: string | null; error_message: string | null; }
+export interface ScheduledTask { id: number; name: string; frequency: ScheduleFrequency; run_at: string; old_path: string; new_path: string; old_layout_id: string; new_layout_id: string; archive_path: string; status: ScheduleStatus; created_at: string; last_run_at: string | null; error_message: string | null; }
 export interface NewScheduledTask { name: string; frequency: ScheduleFrequency; run_at: string; old_path: string; new_path: string; old_layout_id: string; new_layout_id: string; archive_path: string; }

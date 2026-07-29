@@ -7,9 +7,9 @@ export const api = {
   listComparisons: () => request<ComparisonRun[]>("/comparisons"),
   createComparison: (data: FormData) => request<ComparisonResponse>("/comparisons", { method: "POST", body: data }),
   getDelta: (id: string) => request<DeltaRow[]>(`/comparisons/${id}/delta`),
-  listScheduled: (status = "pending") => request<ScheduledTask[]>(`/scheduled?status=${encodeURIComponent(status)}`),
+  listScheduled: (status = "all") => request<ScheduledTask[]>(`/scheduled?status=${encodeURIComponent(status)}`),
   createScheduled: (task: NewScheduledTask) => request<ScheduledTask>("/scheduled", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) }),
-  updateScheduled: (id: string, task: NewScheduledTask) => request<ScheduledTask>(`/scheduled/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) }),
-  deleteScheduled: (id: string) => request<void>(`/scheduled/${id}`, { method: "DELETE" }),
-  runScheduledNow: (id: string) => request<void>(`/scheduled/${id}/run-now`, { method: "POST" }),
+  updateScheduled: (id: number, task: NewScheduledTask) => request<ScheduledTask>(`/scheduled/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) }),
+  deleteScheduled: (id: number) => request<void>(`/scheduled/${id}`, { method: "DELETE" }),
+  runScheduledNow: (id: number) => request<void>(`/scheduled/${id}/run-now`, { method: "POST" }),
 };

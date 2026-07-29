@@ -17,7 +17,11 @@ CREATE TABLE comparison_runs (
     new_origin_file_name TEXT NOT NULL,
     processing_started_at TIMESTAMPTZ NOT NULL,
     processing_duration_ms BIGINT,
-    CHECK (processing_duration_ms IS NULL OR processing_duration_ms >= 0)
+    old_row_count BIGINT,
+    new_row_count BIGINT,
+    CHECK (processing_duration_ms IS NULL OR processing_duration_ms >= 0),
+    CHECK (old_row_count IS NULL OR old_row_count >= 0),
+    CHECK (new_row_count IS NULL OR new_row_count >= 0)
 );
 
 CREATE TABLE delta_rows (
@@ -30,3 +34,31 @@ CREATE TABLE delta_rows (
     changed_fields JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 CREATE INDEX delta_rows_comparison_type_idx ON delta_rows (comparison_id, change_type);
+
+CREATE TABLE scheduled (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    frequency TEXT NOT NULL CHECK (frequency IN ('one_time', 'daily', 'weekly', 'monthly')),
+    run_at TIMESTAMPTZ NOT NULL,
+    old_path TEXT NOT NULL,
+    new_path TEXT NOT NULL,
+    old_layout_id UUID NOT NULL REFERENCES layouts(id),
+    new_layout_id UUID NOT NULL REFERENCES layouts(id),
+    archive_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_run_at TIMESTAMPTZ,
+    error_message TEXT
+);
+
+CREATE INDEX scheduled_due_idx ON scheduled (run_at) WHERE status = 'pending';
+
+CREATE TABLE scheduled_runs (
+    id BIGSERIAL PRIMARY KEY,
+    scheduled_id BIGINT NOT NULL REFERENCES scheduled(id) ON DELETE CASCADE,
+    comparison_id UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE,
+    old_filename TEXT NOT NULL,
+    new_filename TEXT NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (scheduled_id, old_filename, new_filename)
+);
