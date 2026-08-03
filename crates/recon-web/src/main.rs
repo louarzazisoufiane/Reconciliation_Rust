@@ -10,7 +10,7 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -65,18 +65,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(scheduled_worker(state.clone()));
     let api = Router::new()
         .route("/layouts", get(list_layouts).post(create_layout))
-        .route(
-            "/comparisons",
-            get(list_comparisons).post(create_comparison),
-        )
+        .route("/comparisons", get(list_comparisons).post(create_comparison))
         .route("/comparisons/{id}/delta", get(list_delta))
         .route("/scheduled", get(list_scheduled).post(create_scheduled))
-        .route(
-            "/scheduled/{id}",
-            get(get_scheduled)
-                .put(update_scheduled)
-                .delete(delete_scheduled),
-        )
+        .route("/scheduled/{id}", get(get_scheduled).put(update_scheduled).delete(delete_scheduled))
         .route("/scheduled/{id}/run-now", post(run_scheduled_now))
         .with_state(state);
     // Multipart is streamed and rows are batched below; do not impose Axum's
@@ -112,7 +104,7 @@ async fn ensure_database_exists(url: &str) -> anyhow::Result<()> {
             .fetch_one(&pool)
             .await?;
     if !exists {
-        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        let quoted = format!("\"{}\"", name);
         sqlx::query(&format!("CREATE DATABASE {quoted}"))
             .execute(&pool)
             .await?;
@@ -223,8 +215,7 @@ struct ComparisonHistoryRow {
     id: Uuid,
     run_index: i64,
     run_name: String,
-    // The run's start time is also its creation time: a run is created only
-    // when processing begins, so no redundant database column is needed.
+
     created_at: String,
     processing_duration_ms: Option<i64>,
     processing_started_at: Option<String>,
@@ -402,10 +393,6 @@ struct ScheduledTask {
     error_message: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ScheduledFilter {
-    status: Option<String>,
-}
 
 async fn validate_schedule_request(request: &mut CreateScheduledRequest) -> anyhow::Result<()> {
     request.name = request.name.trim().to_owned();
@@ -418,12 +405,6 @@ async fn validate_schedule_request(request: &mut CreateScheduledRequest) -> anyh
     }
     if request.name.is_empty() {
         anyhow::bail!("schedule name is required");
-    }
-    if !matches!(
-        request.frequency.as_str(),
-        "one_time" | "daily" | "weekly" | "monthly"
-    ) {
-        anyhow::bail!("frequency must be one_time, daily, weekly, or monthly");
     }
     if request.archive_path.is_empty() {
         anyhow::bail!("archive path is required");
@@ -450,29 +431,10 @@ const SCHEDULE_SELECT: &str = "SELECT id, name, frequency, run_at::text AS run_a
 
 async fn list_scheduled(
     State(state): State<AppState>,
-    Query(filter): Query<ScheduledFilter>,
 ) -> ApiResult<Vec<ScheduledTask>> {
-    let rows =
-        match filter.status.as_deref() {
-            Some("all") | None => {
-                sqlx::query_as(&format!("{SCHEDULE_SELECT} ORDER BY run_at"))
-                    .fetch_all(&state.pool)
-                    .await?
-            }
-            Some("pending") => sqlx::query_as(&format!(
-                "{SCHEDULE_SELECT} WHERE status IN ('pending', 'running', 'failed') ORDER BY run_at"
-            ))
-            .fetch_all(&state.pool)
-            .await?,
-            Some(status) => {
-                sqlx::query_as(&format!(
-                    "{SCHEDULE_SELECT} WHERE status = $1 ORDER BY run_at"
-                ))
-                .bind(status)
-                .fetch_all(&state.pool)
-                .await?
-            }
-        };
+    let rows = sqlx::query_as(&format!("{SCHEDULE_SELECT} ORDER BY run_at"))
+        .fetch_all(&state.pool)
+        .await?;
     Ok(Json(rows))
 }
 

@@ -7,7 +7,7 @@ export const api = {
   listComparisons: () => request<ComparisonRun[]>("/comparisons"),
   createComparison: (data: FormData) => request<ComparisonResponse>("/comparisons", { method: "POST", body: data }),
   getDelta: (id: string) => request<DeltaRow[]>(`/comparisons/${id}/delta`),
-  listScheduled: (status = "all") => request<ScheduledTask[]>(`/scheduled?status=${encodeURIComponent(status)}`),
+  listScheduled: () => request<ScheduledTask[]>("/scheduled"),
   createScheduled: (task: NewScheduledTask) => request<ScheduledTask>("/scheduled", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) }),
   updateScheduled: (id: number, task: NewScheduledTask) => request<ScheduledTask>(`/scheduled/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) }),
   deleteScheduled: (id: number) => request<void>(`/scheduled/${id}`, { method: "DELETE" }),
